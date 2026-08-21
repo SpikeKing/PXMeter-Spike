@@ -160,6 +160,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--use-msa", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--use-rna-msa",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="启用 RNA MSA（默认启用；可用 --no-use-rna-msa 关闭）。",
+    )
+    parser.add_argument(
         "--use-template", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
@@ -296,10 +302,13 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         "mmcif",
         "mmcif_bioassembly",
     ]
-    # 模板和 MSA 都通过相同的序列映射定位预计算目录。
+    # 蛋白模板和蛋白 MSA 通过相同的序列映射定位预计算目录。
     if args.use_msa or args.use_template:
         required_files.append("pdb_seqs/seq_to_pdb_index.json")
         required_dirs.append("mmcif_msa_template")
+    if args.use_rna_msa:
+        required_files.append("rna_msa/rna_sequence_to_pdb_chains.json")
+        required_dirs.append("rna_msa/msas")
     if args.use_template:
         required_files.extend(
             [
@@ -380,7 +389,7 @@ def build_configs(args: argparse.Namespace) -> Any:
     configs.dtype = args.dtype
     configs.use_msa = args.use_msa
     configs.use_template = args.use_template
-    configs.use_rna_msa = False
+    configs.use_rna_msa = args.use_rna_msa
     configs.need_atom_confidence = False
     configs.sorted_by_ranking_score = True
     configs.triangle_multiplicative = args.triangle_multiplicative
@@ -424,7 +433,15 @@ def build_dataset(args: argparse.Namespace, configs: Any) -> Any:
     )
     dataset_config["cropping_configs"]["crop_size"] = -1
     dataset_config["msa"]["enable_prot_msa"] = args.use_msa
-    dataset_config["msa"]["enable_rna_msa"] = False
+    dataset_config["msa"]["enable_rna_msa"] = args.use_rna_msa
+    if args.use_rna_msa:
+        dataset_config["msa"]["rna_seq_or_filename_to_msadir_jsons"] = [
+            str(args.data_root / "rna_msa/rna_sequence_to_pdb_chains.json")
+        ]
+        dataset_config["msa"]["rna_msadir_raw_paths"] = [
+            str(args.data_root / "rna_msa/msas")
+        ]
+        dataset_config["msa"]["rna_indexing_methods"] = ["sequence"]
     dataset_config["template"]["enable_prot_template"] = args.use_template
     if args.use_template:
         dataset_config["template"]["kalign_binary_path"] = str(args.kalign_binary)
@@ -435,7 +452,7 @@ def build_dataset(args: argparse.Namespace, configs: Any) -> Any:
     # 读取映射/日期文件，既浪费时间，也会让 --no-use-* 模式错误依赖这些文件。
     msa_featurizer = (
         get_msa_featurizer(configs, dataset_name, stage="test")
-        if args.use_msa
+        if args.use_msa or args.use_rna_msa
         else None
     )
     template_featurizer = (
@@ -462,6 +479,15 @@ def sample_name(dataset: Any, index: int) -> str:
     """取得按 PDB 聚合后的样本名称。"""
 
     return str(dataset._get_sample_indice(index)["pdb_id"])
+
+
+def selected_pdb_ids(dataset: Any) -> list[str]:
+    """返回过滤、聚合和 ``--limit`` 后本轮实际覆盖的 PDB。"""
+
+    pdb_ids = [sample_name(dataset, index) for index in range(len(dataset))]
+    if len(set(pdb_ids)) != len(pdb_ids):
+        raise ValueError("Grouped inference dataset contains duplicate PDB IDs")
+    return pdb_ids
 
 
 def sample_num_tokens(dataset: Any, index: int) -> int:
@@ -1435,6 +1461,8 @@ def _run_unlocked(args: argparse.Namespace) -> int:
         summary = {
             "model": MODEL_NAME,
             "indices_csv": str(args.indices_csv),
+            "pdb_ids": selected_pdb_ids(dataset),
+            "ref_assembly_id": "1",
             "world_size": world_size,
             "seeds": args.seeds,
             "samples": args.samples,
@@ -1442,6 +1470,7 @@ def _run_unlocked(args: argparse.Namespace) -> int:
             "steps": args.steps,
             "dtype": args.dtype,
             "use_msa": args.use_msa,
+            "use_rna_msa": args.use_rna_msa,
             "use_template": args.use_template,
             "assignment_strategy": ASSIGNMENT_STRATEGY,
             "final_status_timeout_seconds": FINAL_STATUS_TIMEOUT_SECONDS,

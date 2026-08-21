@@ -3,7 +3,7 @@
 
 该脚本读取 ``batch_infer_indices.py`` 生成的推理目录和汇总文件，自动：
 
-1. 从 indices CSV 收集全部唯一 PDB，限定本次评估的数据集范围；
+1. 从推理目录的 ``batch_summary.json`` 读取实际 PDB、seed 和 sample 范围；
 2. 将 ``.cif`` 或 ``.cif.gz`` 参考结构准备为 PXMeter 所需的 ``.cif`` 视图，
    并仅在临时副本中移除 ``_exptl`` 元数据，使参考侧保留 SO4/GOL/PEG
    等结晶辅助实体；
@@ -16,9 +16,7 @@
 
 示例::
 
-    python myscripts/run_pxmeter.py \
-      --pxmeter-root /path/to/PXMeter \
-      --indices-csv /data/protenix_data_sabdab2/indices/val.csv \
+    python myscripts/step2-evaluate_abag.py \
       --pred-dir /data/my_runs/protenix_base_v1_val \
       --ref-dir /data/protenix_data_sabdab2/mmcif \
       --output-root /data/my_runs/protenix_base_v1_val_pxmeter \
@@ -45,14 +43,11 @@ from typing import Any, Sequence
 from tqdm import tqdm
 
 from pxmeter_utils import (
-    PXMETER_MODULES,
     REPO_ROOT,
     ConfigurationError,
     EvaluationError,
     add_pxmeter_to_pythonpath,
-    is_pxmeter_source_root,
     publish_artifact,
-    resolve_pxmeter_root,
     run_pxmeter_module,
     validate_pxmeter_modules,
     validate_summary_outputs,
@@ -61,7 +56,6 @@ from pxmeter_utils import (
 
 
 LOGGER = logging.getLogger("evaluate_pxmeter")
-REQUIRED_INDEX_COLUMNS = {"pdb_id"}
 REQUIRED_SABDAB_COLUMNS = {
     "PDB",
     "INSTANCE",
@@ -90,6 +84,8 @@ class BatchInfo:
 
     seeds: tuple[int, ...]
     samples: int
+    pdb_ids: tuple[str, ...]
+    ref_assembly_id: str
 
 
 @dataclass(frozen=True)
@@ -124,21 +120,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="运行 PXMeter 并汇总 Protenix 全部默认链和界面评估结果。"
     )
     parser.add_argument(
-        "--pxmeter-root",
-        type=Path,
-        default=None,
-        help=(
-            "PXMeter 源码仓库根目录；默认依次检查 PXMETER_ROOT 环境变量和 "
-            "Protenix 同级的 PXMeter 目录。"
-        ),
-    )
-    parser.add_argument(
-        "--indices-csv",
-        required=True,
-        type=Path,
-        help="val/test CSV；其中全部唯一 pdb_id 定义本次评估的数据集范围。",
-    )
-    parser.add_argument(
         "--pred-dir",
         required=True,
         type=Path,
@@ -164,11 +145,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=-1,
         help="PXMeter CPU 并行数；-1 表示使用全部可用 CPU（默认）。",
-    )
-    parser.add_argument(
-        "--ref-assembly-id",
-        default="1",
-        help="参考 mmCIF 的 biological assembly ID（默认：1）。",
     )
     parser.add_argument(
         "--sabdab-summary-csv",
@@ -205,7 +181,6 @@ def require_dir(path: Path, label: str) -> Path:
 
 
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
-    args.indices_csv = require_file(args.indices_csv, "indices CSV")
     args.pred_dir = require_dir(args.pred_dir, "prediction directory")
     args.ref_dir = require_dir(args.ref_dir, "reference mmCIF directory")
     args.sabdab_summary_csv = getattr(args, "sabdab_summary_csv", None)
@@ -216,9 +191,6 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     args.output_root = args.output_root.expanduser().resolve()
     if args.num_cpu == 0 or args.num_cpu < -1:
         raise ConfigurationError("--num-cpu must be -1 or a positive integer")
-    args.ref_assembly_id = str(args.ref_assembly_id).strip()
-    if not args.ref_assembly_id:
-        raise ConfigurationError("--ref-assembly-id cannot be empty")
     args.output_root.mkdir(parents=True, exist_ok=True)
     if not os.access(args.output_root, os.W_OK):
         raise ConfigurationError(
@@ -228,7 +200,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def load_batch_info(pred_dir: Path) -> BatchInfo:
-    """读取 batch summary，并严格校验 seed 和 sample 数。"""
+    """读取 batch summary，并严格校验本轮推理和参考结构范围。"""
 
     summary_path = require_file(pred_dir / "batch_summary.json", "batch summary")
     try:
@@ -241,6 +213,10 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
 
     seeds = summary.get("seeds") if isinstance(summary, dict) else None
     samples = summary.get("samples") if isinstance(summary, dict) else None
+    pdb_ids = summary.get("pdb_ids") if isinstance(summary, dict) else None
+    ref_assembly_id = (
+        summary.get("ref_assembly_id") if isinstance(summary, dict) else None
+    )
     if (
         not isinstance(seeds, list)
         or not seeds
@@ -255,53 +231,41 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
         raise ConfigurationError(
             f"Invalid samples in {summary_path}; expected a positive integer"
         )
-    return BatchInfo(tuple(seeds), samples)
+    if pdb_ids is None or ref_assembly_id is None:
+        raise ConfigurationError(
+            f"Legacy batch summary lacks pdb_ids/ref_assembly_id: {summary_path}. "
+            "Rerun step1-batch_infer_indices.py with the same arguments and "
+            "without --overwrite; complete predictions will be skipped while "
+            "the summary is upgraded."
+        )
+    if (
+        not isinstance(pdb_ids, list)
+        or not pdb_ids
+        or any(
+            not isinstance(pdb_id, str)
+            or not pdb_id
+            or pdb_id != pdb_id.strip().lower()
+            for pdb_id in pdb_ids
+        )
+        or len(set(pdb_ids)) != len(pdb_ids)
+    ):
+        raise ConfigurationError(
+            f"Invalid pdb_ids in {summary_path}; expected a non-empty list of "
+            "unique, normalized lowercase strings"
+        )
+    if not isinstance(ref_assembly_id, str) or not ref_assembly_id.strip():
+        raise ConfigurationError(
+            f"Invalid ref_assembly_id in {summary_path}; expected a non-empty string"
+        )
+    return BatchInfo(
+        tuple(seeds), samples, tuple(pdb_ids), ref_assembly_id.strip()
+    )
 
 
 def load_batch_seeds(pred_dir: Path) -> list[int]:
     """兼容旧调用方：只返回 batch summary 中的 seed。"""
 
     return list(load_batch_info(pred_dir).seeds)
-
-
-def load_target_pdb_ids(indices_csv: Path) -> tuple[str, ...]:
-    """读取索引中的全部 PDB ID，规范化大小写并去重。"""
-
-    with indices_csv.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = set(reader.fieldnames or [])
-        missing = sorted(REQUIRED_INDEX_COLUMNS - fieldnames)
-        if missing:
-            raise ConfigurationError(
-                f"{indices_csv} is missing required columns: {', '.join(missing)}"
-            )
-
-        pdb_ids: set[str] = set()
-        invalid_rows: list[int] = []
-        row_count = 0
-        for row_number, row in enumerate(reader, start=2):
-            row_count += 1
-            raw_pdb_id = row.get("pdb_id")
-            pdb_id = raw_pdb_id.strip().lower() if raw_pdb_id else ""
-            if not pdb_id:
-                invalid_rows.append(row_number)
-                continue
-            pdb_ids.add(pdb_id)
-
-    if invalid_rows:
-        preview = ", ".join(map(str, invalid_rows[:10]))
-        suffix = (
-            ""
-            if len(invalid_rows) <= 10
-            else f" ... and {len(invalid_rows) - 10} more"
-        )
-        raise ConfigurationError(
-            f"Empty pdb_id in {len(invalid_rows)} row(s) of {indices_csv}: "
-            f"rows {preview}{suffix}"
-        )
-    if row_count == 0 or not pdb_ids:
-        raise ConfigurationError(f"No PDB IDs found in {indices_csv}")
-    return tuple(sorted(pdb_ids))
 
 
 def is_na(value: object) -> bool:
@@ -1451,15 +1415,14 @@ def publish_run_results(run_root: Path, output_root: Path) -> None:
 
 def run(args: argparse.Namespace) -> int:
     args = validate_args(args)
-    pxmeter_root = validate_pxmeter_modules(getattr(args, "pxmeter_root", None))
+    pxmeter_root = validate_pxmeter_modules(REPO_ROOT)
+    batch_info = load_batch_info(args.pred_dir)
     antibody_mode = args.sabdab_summary_csv is not None
     sabdab_by_pdb = (
         load_sabdab_instances(args.sabdab_summary_csv) if antibody_mode else {}
     )
     if antibody_mode:
         add_pxmeter_to_current_process(pxmeter_root)
-
-    batch_info = load_batch_info(args.pred_dir)
 
     # 所有中间结果都写入临时目录。只有评估与聚合完整成功后才覆盖正式结果，
     # 因此旧 metrics/ERR/summary 不会污染重跑，失败也不会破坏上一份结果。
@@ -1477,7 +1440,7 @@ def run(args: argparse.Namespace) -> int:
         per_sample_dir.mkdir(parents=True)
         summary_dir.mkdir(parents=True)
 
-        pdb_ids = load_target_pdb_ids(args.indices_csv)
+        pdb_ids = batch_info.pdb_ids
         reference_cifs = validate_reference_cifs(args.ref_dir, pdb_ids)
         prediction_count = validate_target_predictions(
             args.pred_dir,
@@ -1519,7 +1482,7 @@ def run(args: argparse.Namespace) -> int:
             ) = prepare_antibody_targets(
                 alias_to_pdb_id,
                 ref_view_dir,
-                args.ref_assembly_id,
+                batch_info.ref_assembly_id,
                 sabdab_by_pdb,
             )
             if not antibody_targets:
@@ -1590,7 +1553,7 @@ def run(args: argparse.Namespace) -> int:
                 "-m",
                 "protenix",
                 "-r",
-                args.ref_assembly_id,
+                batch_info.ref_assembly_id,
                 "-n",
                 str(args.num_cpu),
             ]
@@ -1619,7 +1582,7 @@ def run(args: argparse.Namespace) -> int:
                     args.pred_dir,
                     per_sample_dir,
                     batch_info,
-                    args.ref_assembly_id,
+                    batch_info.ref_assembly_id,
                     unresolved_rows,
                 )
                 antibody_subset_rows, antibody_detail_rows = (
