@@ -36,8 +36,9 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 from tqdm import tqdm
@@ -88,6 +89,14 @@ CDR_BACKBONE_METRICS = (
     "cdr_l2_bb_rmsd",
     "cdr_l3_bb_rmsd",
 )
+THREAD_LIMIT_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 
 def pxmeter_seed_dir(seed: int) -> str:
@@ -105,6 +114,43 @@ class BatchInfo:
     pdb_ids: tuple[str, ...]
     ref_assembly_id: str
     indices_csv: Path
+
+
+@dataclass(frozen=True)
+class WorkerPlan:
+    """Worker counts assigned to the sequential evaluation stages."""
+
+    total_workers: int
+    eval_workers: int
+    aggregate_workers: int
+
+
+def build_worker_plan(
+    num_cpu: int, detected_cpu_count: int | None = None
+) -> WorkerPlan:
+    """Use the requested worker budget for each sequential processing stage."""
+
+    if num_cpu == -1:
+        total_workers = detected_cpu_count
+        if total_workers is None:
+            try:
+                from joblib import cpu_count
+
+                # joblib/loky accounts for CPU affinity and container quotas.
+                total_workers = cpu_count()
+            except ImportError:
+                get_affinity = getattr(os, "sched_getaffinity", None)
+                total_workers = (
+                    len(get_affinity(0)) if get_affinity is not None else os.cpu_count()
+                )
+    else:
+        total_workers = num_cpu
+    total_workers = total_workers or 1
+    return WorkerPlan(
+        total_workers,
+        total_workers,
+        total_workers,
+    )
 
 
 @dataclass(frozen=True)
@@ -150,6 +196,9 @@ class AntibodyTarget:
     sabdab_instances: tuple[str, ...]
     interface_metadata: dict[tuple[str, str], dict[str, str]]
     sabdab_metadata: dict[str, str]
+    cdr_annotations: dict[str, tuple[tuple[str, ...], str]] = field(
+        default_factory=dict
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -181,7 +230,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--num-cpu",
         type=int,
         default=-1,
-        help="PXMeter CPU 并行数；-1 表示使用全部可用 CPU（默认）。",
+        help=(
+            "每个串行阶段的最大 worker 数；"
+            "-1 表示使用全部可用 CPU（默认）。"
+        ),
     )
     parser.add_argument(
         "--sabdab-summary-csv",
@@ -719,7 +771,11 @@ def prepare_antibody_targets(
             "Antibody mode requires PXMeter's numpy/biotite/ANARCII dependencies"
         ) from exc
 
-    annotator = AntibodyAnnotator(scheme="imgt", seq_type="unknown", ncpu=1)
+    annotator = AntibodyAnnotator(
+        scheme="imgt",
+        seq_type="unknown",
+        ncpu=1,
+    )
     targets: dict[str, AntibodyTarget] = {}
     annotation_rows: list[dict[str, str]] = []
     unresolved: list[dict[str, str]] = []
@@ -786,6 +842,10 @@ def prepare_antibody_targets(
             annotations = [(["-"] * len(seq), "Unknown") for seq in protein_sequences]
         entity_to_chain_type = {
             entity: result[1]
+            for entity, result in zip(protein_entities, annotations)
+        }
+        cdr_annotations = {
+            entity: (tuple(map(str, result[0])), str(result[1]))
             for entity, result in zip(protein_entities, annotations)
         }
 
@@ -1030,6 +1090,7 @@ def prepare_antibody_targets(
                 sabdab_instances=tuple(dict.fromkeys(instance_ids)),
                 interface_metadata=interface_metadata,
                 sabdab_metadata=sabdab_metadata,
+                cdr_annotations=cdr_annotations,
             )
             for label_id in sorted(ligand_label_ids):
                 internal_ligand_rows.append(
@@ -1224,8 +1285,12 @@ def validate_evaluation_results(
     return metric_count, error_logs
 
 
-def calculate_six_cdr_rmsds(ref_struct, model_struct) -> tuple[dict, list[dict]]:
-    """在 PXMeter 已映射结构上计算 IMGT 六条 CDR 的框架对齐主链 RMSD。"""
+def calculate_six_cdr_rmsds(
+    ref_struct,
+    model_struct,
+    cached_annotations: dict[str, tuple[tuple[str, ...], str]] | None = None,
+) -> tuple[dict[str, dict[str, float]], list[dict[str, str]]]:
+    """Calculate six IMGT CDR backbone RMSDs on PXMeter-mapped structures."""
 
     import numpy as np
 
@@ -1235,33 +1300,55 @@ def calculate_six_cdr_rmsds(ref_struct, model_struct) -> tuple[dict, list[dict]]
 
     protein_mask = ref_struct.get_mask_for_given_entity_types(PROTEIN)
     entity_ids = np.unique(ref_struct.atom_array.label_entity_id[protein_mask])
-    sequences: list[str] = []
-    entity_to_seq: dict[str, int] = {}
-    for entity_id in entity_ids:
-        sequence = ref_struct.entity_poly_seq.get(entity_id, "")
-        if not sequence:
-            continue
-        try:
-            index = sequences.index(sequence)
-        except ValueError:
-            sequences.append(sequence)
-            index = len(sequences) - 1
-        entity_to_seq[str(entity_id)] = index
-    if not sequences:
+    annotations_by_entity = {
+        str(entity_id): (tuple(regions), chain_type)
+        for entity_id, (regions, chain_type) in (cached_annotations or {}).items()
+    }
+    missing_entities = [
+        entity_id
+        for entity_id in entity_ids
+        if str(entity_id) not in annotations_by_entity
+        and ref_struct.entity_poly_seq.get(entity_id, "")
+    ]
+    if missing_entities:
+        unique_sequences: list[str] = []
+        entity_to_sequence_index: dict[str, int] = {}
+        for entity_id in missing_entities:
+            sequence = ref_struct.entity_poly_seq.get(entity_id, "")
+            try:
+                sequence_index = unique_sequences.index(sequence)
+            except ValueError:
+                unique_sequences.append(sequence)
+                sequence_index = len(unique_sequences) - 1
+            entity_to_sequence_index[str(entity_id)] = sequence_index
+        annotations = AntibodyAnnotator(
+            scheme="imgt",
+            seq_type="unknown",
+            ncpu=1,
+        ).annotate(unique_sequences)
+        for entity_id, sequence_index in entity_to_sequence_index.items():
+            regions, chain_type = annotations[sequence_index]
+            annotations_by_entity[entity_id] = (tuple(regions), chain_type)
+
+    if not annotations_by_entity:
         return {}, [{"chain_id": "", "reason": "no_protein_sequence"}]
 
-    annotations = AntibodyAnnotator(
-        scheme="imgt", seq_type="unknown", ncpu=1
-    ).annotate(sequences)
     results: dict[str, dict[str, float]] = {}
     problems: list[dict[str, str]] = []
     for chain_id in np.unique(ref_struct.uni_chain_id[protein_mask]):
         chain_mask = ref_struct.uni_chain_id == chain_id
         first = int(np.flatnonzero(chain_mask)[0])
         entity_id = str(ref_struct.atom_array.label_entity_id[first])
-        if entity_id not in entity_to_seq:
+        annotation = annotations_by_entity.get(entity_id)
+        if annotation is None:
+            problems.append(
+                {
+                    "chain_id": str(chain_id),
+                    "reason": "antibody_annotation_missing",
+                }
+            )
             continue
-        regions, chain_type = annotations[entity_to_seq[entity_id]]
+        regions, chain_type = annotation
         role = antibody_role(chain_type)
         if role is None:
             continue
@@ -1289,9 +1376,9 @@ def calculate_six_cdr_rmsds(ref_struct, model_struct) -> tuple[dict, list[dict]]
         atom_regions = np.array([regions[int(res_id) - 1] for res_id in res_ids])
         ref_coords = ref_struct.atom_array.coord[atom_indices]
         model_coords = model_struct.atom_array.coord[atom_indices]
-        valid_coords = ~np.isnan(ref_coords).any(axis=1) & ~np.isnan(model_coords).any(
-            axis=1
-        )
+        valid_coords = np.isfinite(ref_coords).all(axis=1) & np.isfinite(
+            model_coords
+        ).all(axis=1)
         if model_struct.valid_mask is not None:
             valid_coords &= model_struct.valid_mask[atom_indices]
         if ref_struct.valid_mask is not None:
@@ -1338,110 +1425,253 @@ def calculate_six_cdr_rmsds(ref_struct, model_struct) -> tuple[dict, list[dict]]
     return results, problems
 
 
+@dataclass(frozen=True)
+class CDRTask:
+    pdb_id: str
+    seed: int
+    sample: int
+    reference_cif: Path
+    prediction_cif: Path
+    metrics_path: Path
+    ref_assembly_id: str
+    cached_annotations: dict[str, tuple[tuple[str, ...], str]]
+
+
+@dataclass(frozen=True)
+class CDRTaskResult:
+    pdb_id: str
+    seed: int
+    sample: int
+    metrics_path: Path
+    calculated: dict[str, dict[str, float]]
+    problems: tuple[dict[str, str], ...]
+    error: str = ""
+
+
+def calculate_cdr_task(task: CDRTask) -> CDRTaskResult:
+    """Map one prediction and calculate its CDR metrics without writing files."""
+
+    try:
+        from pxmeter.mapping import MappingResult
+
+        mapping = MappingResult.from_cifs(
+            ref_cif=task.reference_cif,
+            model_cif=task.prediction_cif,
+            ref_model=1,
+            ref_assembly_id=task.ref_assembly_id,
+            ref_altloc="first",
+        )
+        ref_struct, model_struct = mapping.get_mapped_structures()
+        calculated, problems = calculate_six_cdr_rmsds(
+            ref_struct,
+            model_struct,
+            task.cached_annotations,
+        )
+        return CDRTaskResult(
+            task.pdb_id,
+            task.seed,
+            task.sample,
+            task.metrics_path,
+            calculated,
+            tuple(problems),
+        )
+    except Exception as exc:
+        return CDRTaskResult(
+            task.pdb_id,
+            task.seed,
+            task.sample,
+            task.metrics_path,
+            {},
+            (),
+            str(exc),
+        )
+
+
 def postprocess_cdr_metrics(
     targets: dict[str, AntibodyTarget],
     pred_dir: Path,
     per_sample_dir: Path,
     batch_info: BatchInfo,
-    ref_assembly_id: str,
+    num_workers: int,
     unresolved: list[dict[str, str]],
 ) -> list[dict[str, Any]]:
-    """复用 PXMeter 映射口径补齐五条 CDR，并校验原生 CDR-H3。"""
+    """Calculate six CDR metrics in parallel and serialize writes in the parent."""
 
-    from pxmeter.mapping import MappingResult
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    tasks = [
+        CDRTask(
+            pdb_id=pdb_id,
+            seed=seed,
+            sample=sample,
+            reference_cif=target.reference_cif,
+            prediction_cif=(
+                pred_dir
+                / pdb_id
+                / f"seed_{seed}"
+                / "predictions"
+                / f"{pdb_id}_sample_{sample}.cif"
+            ),
+            metrics_path=(
+                per_sample_dir
+                / pdb_id
+                / pxmeter_seed_dir(seed)
+                / f"sample_{sample}_metrics.json"
+            ),
+            ref_assembly_id=batch_info.ref_assembly_id,
+            cached_annotations=target.cdr_annotations,
+        )
+        for pdb_id, target in sorted(targets.items())
+        for seed in batch_info.seeds
+        for sample in range(batch_info.samples)
+    ]
+    if not tasks:
+        return []
+    num_workers = min(num_workers, len(tasks))
+    if num_workers == 1:
+        results = [
+            calculate_cdr_task(task)
+            for task in tqdm(
+                tasks,
+                total=len(tasks),
+                desc="计算六条 CDR RMSD",
+                unit="样本",
+                disable=not sys.stderr.isatty(),
+            )
+        ]
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_task = {
+                executor.submit(calculate_cdr_task, task): task for task in tasks
+            }
+            results = []
+            for future in tqdm(
+                as_completed(future_to_task),
+                total=len(future_to_task),
+                desc="计算六条 CDR RMSD",
+                unit="样本",
+                disable=not sys.stderr.isatty(),
+            ):
+                task = future_to_task[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(
+                        CDRTaskResult(
+                            task.pdb_id,
+                            task.seed,
+                            task.sample,
+                            task.metrics_path,
+                            {},
+                            (),
+                            str(exc),
+                        )
+                    )
+    results.sort(
+        key=lambda result: (
+            result.pdb_id,
+            result.seed,
+            result.sample,
+        )
+    )
 
     rows: list[dict[str, Any]] = []
-    total = len(targets) * len(batch_info.seeds) * batch_info.samples
-    progress = tqdm(
-        total=total,
-        desc="计算六条 CDR RMSD",
-        unit="样本",
-        disable=not sys.stderr.isatty(),
-    )
-    try:
-        for pdb_id, target in targets.items():
-            for seed in batch_info.seeds:
-                for sample in range(batch_info.samples):
-                    metrics_path = (
-                        per_sample_dir
-                        / pdb_id
-                        / pxmeter_seed_dir(seed)
-                        / f"sample_{sample}_metrics.json"
-                    )
-                    pred_cif = (
-                        pred_dir
-                        / pdb_id
-                        / f"seed_{seed}"
-                        / "predictions"
-                        / f"{pdb_id}_sample_{sample}.cif"
-                    )
-                    try:
-                        with metrics_path.open("r", encoding="utf-8") as handle:
-                            metrics = json.load(handle)
-                        mapping = MappingResult.from_cifs(
-                            ref_cif=target.reference_cif,
-                            model_cif=pred_cif,
-                            ref_model=1,
-                            ref_assembly_id=ref_assembly_id,
-                            ref_altloc="first",
-                        )
-                        ref_struct, model_struct = mapping.get_mapped_structures()
-                        calculated, problems = calculate_six_cdr_rmsds(
-                            ref_struct, model_struct
-                        )
-                    except Exception as exc:
-                        append_unresolved(
-                            unresolved,
-                            pdb_id,
-                            "cdr_postprocess_failed",
-                            f"seed={seed}, sample={sample}: {exc}",
-                        )
-                        progress.update(1)
-                        continue
+    for result in results:
+        if result.error:
+            append_unresolved(
+                unresolved,
+                result.pdb_id,
+                "cdr_postprocess_failed",
+                f"seed={result.seed}, sample={result.sample}: {result.error}",
+            )
+            continue
+        for problem in result.problems:
+            append_unresolved(
+                unresolved,
+                result.pdb_id,
+                "cdr_unavailable",
+                f"seed={result.seed}, sample={result.sample}: {problem['reason']}",
+                chain_id=problem.get("chain_id", ""),
+            )
+        try:
+            with result.metrics_path.open("r", encoding="utf-8") as handle:
+                metrics = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            append_unresolved(
+                unresolved,
+                result.pdb_id,
+                "cdr_metrics_read_failed",
+                f"seed={result.seed}, sample={result.sample}: {exc}",
+            )
+            continue
+        if not isinstance(metrics, dict):
+            append_unresolved(
+                unresolved,
+                result.pdb_id,
+                "cdr_metrics_read_failed",
+                (
+                    f"seed={result.seed}, sample={result.sample}: "
+                    "metrics JSON is not an object"
+                ),
+            )
+            continue
 
-                    for problem in problems:
-                        append_unresolved(
-                            unresolved,
-                            pdb_id,
-                            "cdr_unavailable",
-                            f"seed={seed}, sample={sample}: {problem['reason']}",
-                            chain_id=problem.get("chain_id", ""),
-                        )
-                    chain_metrics = metrics.setdefault("chain", {})
-                    for chain_id, values in calculated.items():
-                        published = chain_metrics.setdefault(chain_id, {})
-                        recomputed_h3 = values.get("cdr_h3_bb_rmsd")
-                        native_h3 = published.get("cdr_h3_bb_rmsd")
-                        if native_h3 is not None and recomputed_h3 is not None:
-                            if abs(float(native_h3) - recomputed_h3) > 1e-5:
-                                append_unresolved(
-                                    unresolved,
-                                    pdb_id,
-                                    "cdr_h3_validation_mismatch",
-                                    (
-                                        f"seed={seed}, sample={sample}: native={native_h3}, "
-                                        f"recomputed={recomputed_h3}"
-                                    ),
-                                    chain_id=chain_id,
-                                )
-                        for name, value in values.items():
-                            if name != "cdr_h3_bb_rmsd":
-                                published[name] = value
-                        row: dict[str, Any] = {
-                            "entry_id": pdb_id,
-                            "seed": seed,
-                            "sample": sample,
-                            "chain_id": chain_id,
-                            "antibody_role": target.antibody_chains.get(chain_id, ""),
-                            "cdr_h3_recomputed": recomputed_h3,
-                        }
-                        for metric_name in CDR_BACKBONE_METRICS:
-                            row[metric_name] = published.get(metric_name)
-                        rows.append(row)
-                    write_json_atomic(metrics_path, metrics)
-                    progress.update(1)
-    finally:
-        progress.close()
+        chain_metrics = metrics.setdefault("chain", {})
+        if not isinstance(chain_metrics, dict):
+            append_unresolved(
+                unresolved,
+                result.pdb_id,
+                "cdr_metrics_read_failed",
+                (
+                    f"seed={result.seed}, sample={result.sample}: "
+                    "chain metrics is not an object"
+                ),
+            )
+            continue
+        changed = False
+        target = targets[result.pdb_id]
+        for chain_id, values in sorted(result.calculated.items()):
+            published = chain_metrics.setdefault(chain_id, {})
+            recomputed_h3 = values.get("cdr_h3_bb_rmsd")
+            native_h3 = published.get("cdr_h3_bb_rmsd")
+            if native_h3 is not None and recomputed_h3 is not None:
+                if abs(float(native_h3) - recomputed_h3) > 1e-5:
+                    append_unresolved(
+                        unresolved,
+                        result.pdb_id,
+                        "cdr_h3_validation_mismatch",
+                        (
+                            f"seed={result.seed}, sample={result.sample}: "
+                            f"native={native_h3}, recomputed={recomputed_h3}"
+                        ),
+                        chain_id=chain_id,
+                    )
+            for name, value in values.items():
+                if name != "cdr_h3_bb_rmsd":
+                    published[name] = value
+                    changed = True
+            row: dict[str, Any] = {
+                "entry_id": result.pdb_id,
+                "seed": result.seed,
+                "sample": result.sample,
+                "chain_id": chain_id,
+                "antibody_role": target.antibody_chains.get(chain_id, ""),
+                "cdr_h3_recomputed": recomputed_h3,
+            }
+            for metric_name in CDR_BACKBONE_METRICS:
+                row[metric_name] = published.get(metric_name)
+            rows.append(row)
+        if changed:
+            write_json_atomic(result.metrics_path, metrics)
+
+    rows.sort(
+        key=lambda row: (
+            str(row["entry_id"]),
+            int(row["seed"]),
+            int(row["sample"]),
+            str(row["chain_id"]),
+        )
+    )
     return rows
 
 
@@ -1658,6 +1888,16 @@ def publish_run_results(run_root: Path, output_root: Path) -> None:
 
 def run(args: argparse.Namespace) -> int:
     args = validate_args(args)
+    worker_plan = build_worker_plan(args.num_cpu)
+    for variable in THREAD_LIMIT_ENV_VARS:
+        os.environ[variable] = "1"
+    LOGGER.info(
+        "Sequential stage workers: evaluation=%d, CDR=%d, aggregation=%d; "
+        "BLAS/OpenMP threads per worker=1",
+        worker_plan.eval_workers,
+        worker_plan.total_workers,
+        worker_plan.aggregate_workers,
+    )
     pxmeter_root = validate_pxmeter_modules(REPO_ROOT)
     batch_info = load_batch_info(args.pred_dir)
     antibody_mode = args.sabdab_summary_csv is not None
@@ -1722,6 +1962,7 @@ def run(args: argparse.Namespace) -> int:
         }
         internal_ligand_csv = run_root / "antibody_lig_info_internal.csv"
         if antibody_mode:
+            antibody_prepare_started = time.perf_counter()
             (
                 antibody_targets,
                 annotation_rows,
@@ -1788,10 +2029,12 @@ def run(args: argparse.Namespace) -> int:
                     ligand_rows["internal"],
                 )
             LOGGER.info(
-                "Prepared antibody metadata for %d/%d target(s); ligand chains=%d",
+                "Prepared antibody metadata for %d/%d target(s); "
+                "ligand chains=%d; elapsed=%.2fs",
                 len(antibody_targets),
                 len(pdb_ids),
                 len(ligand_rows["internal"]),
+                time.perf_counter() - antibody_prepare_started,
             )
 
         LOGGER.info(
@@ -1804,6 +2047,8 @@ def run(args: argparse.Namespace) -> int:
 
         env = os.environ.copy()
         env["PXM_MMCIF_DIR"] = str(ref_view_dir)
+        for variable in THREAD_LIMIT_ENV_VARS:
+            env[variable] = "1"
         add_pxmeter_to_pythonpath(env, pxmeter_root)
         workflow = tqdm(
             total=4 if antibody_mode else 2,
@@ -1822,7 +2067,7 @@ def run(args: argparse.Namespace) -> int:
                 "-r",
                 batch_info.ref_assembly_id,
                 "-n",
-                str(args.num_cpu),
+                str(worker_plan.eval_workers),
             ]
             if antibody_mode:
                 run_eval_args.extend(
@@ -1830,10 +2075,15 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if ligand_rows["internal"]:
                     run_eval_args.extend(["-l", str(internal_ligand_csv)])
+            evaluation_started = time.perf_counter()
             run_pxmeter_module(
                 "benchmark.run_eval",
                 tuple(run_eval_args),
                 env,
+            )
+            LOGGER.info(
+                "PXMeter evaluation elapsed=%.2fs",
+                time.perf_counter() - evaluation_started,
             )
             workflow.update(1)
 
@@ -1844,13 +2094,18 @@ def run(args: argparse.Namespace) -> int:
             antibody_subset_rows: list[dict[str, str]] = []
             cdr_rows: list[dict[str, Any]] = []
             if antibody_mode:
+                cdr_started = time.perf_counter()
                 cdr_rows = postprocess_cdr_metrics(
                     antibody_targets,
                     args.pred_dir,
                     per_sample_dir,
                     batch_info,
-                    batch_info.ref_assembly_id,
+                    worker_plan.total_workers,
                     unresolved_rows,
+                )
+                LOGGER.info(
+                    "Six-CDR postprocessing elapsed=%.2fs",
+                    time.perf_counter() - cdr_started,
                 )
                 antibody_subset_rows, antibody_detail_rows = (
                     build_antibody_subset_and_details(
@@ -1924,7 +2179,16 @@ def run(args: argparse.Namespace) -> int:
                 write_csv(
                     antibody_dir / "unresolved.csv",
                     ("pdb_id", "instance_id", "chain_id", "reason", "detail"),
-                    unresolved_rows,
+                    sorted(
+                        unresolved_rows,
+                        key=lambda row: (
+                            row.get("pdb_id", ""),
+                            row.get("instance_id", ""),
+                            row.get("chain_id", ""),
+                            row.get("reason", ""),
+                            row.get("detail", ""),
+                        ),
+                    ),
                 )
                 workflow.update(1)
             trial_name = args.pred_dir.name
@@ -1939,6 +2203,7 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
 
+            aggregation_started = time.perf_counter()
             run_pxmeter_module(
                 "benchmark.show_intersection_results",
                 (
@@ -1947,13 +2212,18 @@ def run(args: argparse.Namespace) -> int:
                     "-o",
                     str(summary_dir),
                     "-n",
-                    str(args.num_cpu),
+                    str(worker_plan.aggregate_workers),
                     "--overwrite_agg",
                 ),
                 env,
             )
+            LOGGER.info(
+                "PXMeter full aggregation elapsed=%.2fs",
+                time.perf_counter() - aggregation_started,
+            )
             workflow.update(1)
             if antibody_mode and antibody_subset_rows:
+                subset_aggregation_started = time.perf_counter()
                 run_pxmeter_module(
                     "benchmark.show_intersection_results",
                     (
@@ -1962,12 +2232,15 @@ def run(args: argparse.Namespace) -> int:
                         "-o",
                         str(antibody_summary_dir),
                         "-n",
-                        str(args.num_cpu),
+                        str(worker_plan.aggregate_workers),
                         "--subset_csv",
                         str(antibody_dir / "subset.csv"),
-                        "--overwrite_agg",
                     ),
                     env,
+                )
+                LOGGER.info(
+                    "PXMeter antibody subset aggregation elapsed=%.2fs",
+                    time.perf_counter() - subset_aggregation_started,
                 )
                 antibody_summary_table = (
                     antibody_summary_dir / "Summary_table.csv"
