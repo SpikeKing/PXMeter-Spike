@@ -11,8 +11,8 @@
 4. 使用 PXMeter 默认逻辑汇总全部链和界面的 DockQ、LDDT、RMSD 等指标。
 
 提供 ``--sabdab-summary-csv`` 时，还会以 ANARCII 识别 assembly 中的抗体链，
-使用 SAbDab2 的抗原链标注生成抗体专项界面/配体汇总，并计算六条 IMGT CDR
-的框架对齐主链 RMSD。未可靠映射的目标只写入审计表，不会自动猜测抗原。
+使用本轮 indices CSV 的 entity/interface 定位抗原并生成专项汇总，同时计算六条
+IMGT CDR 的框架对齐主链 RMSD。SAbDab 链标注只用于范围、元数据和映射审计。
 
 示例::
 
@@ -36,7 +36,7 @@ import re
 import shutil
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -64,6 +64,18 @@ REQUIRED_SABDAB_COLUMNS = {
     "antigen_chain",
     "antigen_type",
 }
+REQUIRED_INDEX_COLUMNS = {
+    "pdb_id",
+    "type",
+    "entity_1_id",
+    "entity_2_id",
+    "chain_1_id",
+    "chain_2_id",
+    "mol_1_type",
+    "mol_2_type",
+    "cluster_id",
+    "eval_type",
+}
 NA_VALUES = {"", "NA", "N/A", "NULL", "NONE", ".", "?"}
 PDB_CODE_RE = re.compile(
     r"^(?:pdb_0000)?([0-9][0-9a-z]{3})(?:$|[-_.])", re.IGNORECASE
@@ -86,6 +98,23 @@ class BatchInfo:
     samples: int
     pdb_ids: tuple[str, ...]
     ref_assembly_id: str
+    indices_csv: Path
+
+
+@dataclass(frozen=True)
+class IndexRecord:
+    """val_clean.csv 中一条 chain/interface 定位记录。"""
+
+    pdb_id: str
+    record_type: str
+    entity_1_id: str
+    entity_2_id: str
+    chain_1_id: str
+    chain_2_id: str
+    mol_1_type: str
+    mol_2_type: str
+    cluster_id: str
+    eval_type: str
 
 
 @dataclass(frozen=True)
@@ -113,6 +142,8 @@ class AntibodyTarget:
     candidate_interfaces: set[tuple[str, str]]
     ligand_label_asym_ids: set[str]
     sabdab_instances: tuple[str, ...]
+    interface_metadata: dict[tuple[str, str], dict[str, str]]
+    sabdab_metadata: dict[str, str]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -217,6 +248,7 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
     ref_assembly_id = (
         summary.get("ref_assembly_id") if isinstance(summary, dict) else None
     )
+    indices_csv = summary.get("indices_csv") if isinstance(summary, dict) else None
     if (
         not isinstance(seeds, list)
         or not seeds
@@ -257,8 +289,17 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
         raise ConfigurationError(
             f"Invalid ref_assembly_id in {summary_path}; expected a non-empty string"
         )
+    if not isinstance(indices_csv, str) or not indices_csv.strip():
+        raise ConfigurationError(
+            f"Invalid indices_csv in {summary_path}; expected the non-empty path "
+            "recorded by step1-batch_infer_indices.py"
+        )
     return BatchInfo(
-        tuple(seeds), samples, tuple(pdb_ids), ref_assembly_id.strip()
+        tuple(seeds),
+        samples,
+        tuple(pdb_ids),
+        ref_assembly_id.strip(),
+        Path(indices_csv).expanduser().resolve(),
     )
 
 
@@ -266,6 +307,85 @@ def load_batch_seeds(pred_dir: Path) -> list[int]:
     """兼容旧调用方：只返回 batch summary 中的 seed。"""
 
     return list(load_batch_info(pred_dir).seeds)
+
+
+def load_target_index_records(
+    indices_csv: Path,
+    pdb_ids: Sequence[str],
+) -> dict[str, tuple[IndexRecord, ...]]:
+    """加载本轮目标的 val chain/interface 行，并严格校验定位字段。"""
+
+    path = require_file(indices_csv, "indices CSV recorded in batch summary")
+    target_ids = set(pdb_ids)
+    grouped: dict[str, list[IndexRecord]] = defaultdict(list)
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or [])
+        missing = sorted(REQUIRED_INDEX_COLUMNS - fields)
+        if missing:
+            raise ConfigurationError(
+                f"{path} is missing required index columns: {', '.join(missing)}"
+            )
+        for row_number, row in enumerate(reader, start=2):
+            pdb_id = (row.get("pdb_id") or "").strip().lower()
+            if pdb_id not in target_ids:
+                continue
+            record_type = (row.get("type") or "").strip().lower()
+            entity_1_id = (row.get("entity_1_id") or "").strip()
+            entity_2_id = (row.get("entity_2_id") or "").strip()
+            chain_1_id = (row.get("chain_1_id") or "").strip()
+            chain_2_id = (row.get("chain_2_id") or "").strip()
+            if record_type not in {"chain", "interface"}:
+                raise ConfigurationError(
+                    f"Invalid type={record_type!r} in {path}:{row_number}; "
+                    "expected chain or interface"
+                )
+            if not entity_1_id or not chain_1_id:
+                raise ConfigurationError(
+                    f"Missing entity_1_id/chain_1_id in {path}:{row_number}"
+                )
+            if not (row.get("mol_1_type") or "").strip():
+                raise ConfigurationError(
+                    f"Missing mol_1_type in {path}:{row_number}"
+                )
+            if not (row.get("cluster_id") or "").strip() or not (
+                row.get("eval_type") or ""
+            ).strip():
+                raise ConfigurationError(
+                    f"Missing cluster_id/eval_type in {path}:{row_number}"
+                )
+            if record_type == "interface" and (not entity_2_id or not chain_2_id):
+                raise ConfigurationError(
+                    f"Missing entity_2_id/chain_2_id for interface in "
+                    f"{path}:{row_number}"
+                )
+            if record_type == "interface" and not (
+                row.get("mol_2_type") or ""
+            ).strip():
+                raise ConfigurationError(
+                    f"Missing mol_2_type for interface in {path}:{row_number}"
+                )
+            grouped[pdb_id].append(
+                IndexRecord(
+                    pdb_id=pdb_id,
+                    record_type=record_type,
+                    entity_1_id=entity_1_id,
+                    entity_2_id=entity_2_id,
+                    chain_1_id=chain_1_id,
+                    chain_2_id=chain_2_id,
+                    mol_1_type=(row.get("mol_1_type") or "").strip(),
+                    mol_2_type=(row.get("mol_2_type") or "").strip(),
+                    cluster_id=(row.get("cluster_id") or "").strip(),
+                    eval_type=(row.get("eval_type") or "").strip(),
+                )
+            )
+    missing_targets = [pdb_id for pdb_id in pdb_ids if not grouped.get(pdb_id)]
+    if missing_targets:
+        raise ConfigurationError(
+            f"Indices CSV {path} has no rows for batch target(s): "
+            + ", ".join(missing_targets)
+        )
+    return {pdb_id: tuple(grouped[pdb_id]) for pdb_id in pdb_ids}
 
 
 def is_na(value: object) -> bool:
@@ -365,6 +485,26 @@ def append_unresolved(
             "reason": reason,
             "detail": detail,
         }
+    )
+
+
+def publish_unresolved_diagnostics(
+    rows: Sequence[dict[str, str]], staging_path: Path, output_root: Path
+) -> str:
+    """在零目标退出前发布诊断，并返回按原因计数的摘要。"""
+
+    write_csv(
+        staging_path,
+        ("pdb_id", "instance_id", "chain_id", "reason", "detail"),
+        rows,
+    )
+    publish_artifact(
+        staging_path,
+        output_root / "antibody" / "unresolved.csv",
+    )
+    counts = Counter(row.get("reason", "unknown") for row in rows)
+    return ", ".join(
+        f"{reason}={count}" for reason, count in sorted(counts.items())
     )
 
 
@@ -508,18 +648,59 @@ def ligand_has_pxmeter_pocket(structure, ligand_chain_id: str) -> bool:
     )
 
 
+def join_unique(values: Sequence[object]) -> str:
+    """将审计字段合并为稳定、去重的 ``|`` 分隔字符串。"""
+
+    tokens: list[str] = []
+    for value in values:
+        for token in str(value or "").split("|"):
+            token = token.strip()
+            if token and token not in tokens:
+                tokens.append(token)
+    return "|".join(tokens)
+
+
+def merge_audit_metadata(
+    destination: dict[str, str], source: dict[str, str]
+) -> None:
+    for key, value in source.items():
+        destination[key] = join_unique((destination.get(key, ""), value))
+
+
+def unresolved_sabdab_author_chains(
+    instances: Sequence[SAbDabInstance], available_auth_ids: set[str]
+) -> list[tuple[str, str, str]]:
+    """返回不能精确映射的 SAbDab author chain；不做任何后缀变换。"""
+
+    expected = [
+        (item.instance_id, "heavy", chain)
+        for item in instances
+        for chain in item.heavy_chains
+    ] + [
+        (item.instance_id, "light", chain)
+        for item in instances
+        for chain in item.light_chains
+    ] + [
+        (item.instance_id, "antigen", chain)
+        for item in instances
+        for chain in item.antigen_chains
+    ]
+    return [item for item in expected if item[2] not in available_auth_ids]
+
+
 def prepare_antibody_targets(
     alias_to_pdb_id: dict[str, str],
     ref_view_dir: Path,
     ref_assembly_id: str,
     sabdab_by_pdb: dict[str, tuple[SAbDabInstance, ...]],
+    index_records_by_pdb: dict[str, tuple[IndexRecord, ...]],
 ) -> tuple[
     dict[str, AntibodyTarget],
     list[dict[str, str]],
     list[dict[str, str]],
     dict[str, list[dict[str, str]]],
 ]:
-    """识别 assembly 抗体链并把 SAbDab author chain 映射到 PXMeter ID。"""
+    """以 val entity + ANARCII 定位界面，SAbDab 仅提供范围和审计元数据。"""
 
     try:
         import numpy as np
@@ -566,7 +747,7 @@ def prepare_antibody_targets(
 
         reference_cif = ref_view_dir / f"{alias}.cif"
         try:
-            structure = Structure.from_cif(
+            structure = Structure.from_mmcif(
                 reference_cif,
                 model=1,
                 altloc="first",
@@ -605,6 +786,7 @@ def prepare_antibody_targets(
         chain_details: dict[str, dict[str, str]] = {}
         auth_to_uni: dict[str, set[str]] = defaultdict(set)
         label_to_uni: dict[str, set[str]] = defaultdict(set)
+        entity_to_uni: dict[str, set[str]] = defaultdict(set)
         for uni_chain in np.unique(structure.uni_chain_id):
             mask = structure.uni_chain_id == uni_chain
             index = int(np.flatnonzero(mask)[0])
@@ -626,6 +808,7 @@ def prepare_antibody_targets(
             chain_details[str(uni_chain)] = details
             auth_to_uni[auth_id].add(str(uni_chain))
             label_to_uni[label_id].add(str(uni_chain))
+            entity_to_uni[entity_id].add(str(uni_chain))
 
         antibody_chains = {
             chain_id: details["role"]
@@ -640,10 +823,157 @@ def prepare_antibody_targets(
                 "ANARCII did not identify a heavy, kappa, or lambda variable domain",
             )
 
+        instance_ids = [instance.instance_id for instance in instances]
+        sabdab_heavy = [chain for item in instances for chain in item.heavy_chains]
+        sabdab_light = [chain for item in instances for chain in item.light_chains]
+        sabdab_antigens = [chain for item in instances for chain in item.antigen_chains]
+        sabdab_types = [kind for item in instances for kind in item.antigen_types]
+        unresolved_sabdab_chains: list[str] = []
+        for instance_id, chain_role, author_chain in unresolved_sabdab_author_chains(
+            instances, set(auth_to_uni)
+        ):
+            # 只允许 author ID 的精确匹配；绝不删除 M1/E2 等数字后缀。
+            unresolved_sabdab_chains.append(
+                f"{instance_id}:{chain_role}:{author_chain}"
+            )
+            append_unresolved(
+                unresolved,
+                pdb_id,
+                "sabdab_chain_mapping_unresolved",
+                "exact SAbDab author chain is absent from assembly; "
+                "val entity + ANARCII localization remains eligible",
+                instance_id=instance_id,
+                chain_id=author_chain,
+            )
+        sabdab_metadata = {
+            "sabdab_instances": join_unique(instance_ids),
+            "sabdab_heavy_chains": join_unique(sabdab_heavy),
+            "sabdab_light_chains": join_unique(sabdab_light),
+            "sabdab_antigen_chains": join_unique(sabdab_antigens),
+            "sabdab_antigen_types": join_unique(sabdab_types),
+            "sabdab_chain_mapping_status": (
+                "unresolved" if unresolved_sabdab_chains else "exact"
+            ),
+            "sabdab_unresolved_chains": join_unique(unresolved_sabdab_chains),
+        }
+
+        entity_audit: dict[str, dict[str, str]] = defaultdict(dict)
+        for record in index_records_by_pdb.get(pdb_id, ()):
+            for side in (1, 2):
+                entity_id = getattr(record, f"entity_{side}_id")
+                if not entity_id:
+                    continue
+                merge_audit_metadata(
+                    entity_audit[entity_id],
+                    {
+                        "val_chain_ids": getattr(record, f"chain_{side}_id"),
+                        "val_mol_types": getattr(record, f"mol_{side}_type"),
+                        "val_cluster_ids": record.cluster_id,
+                        "val_eval_types": record.eval_type,
+                        "val_record_types": record.record_type,
+                    },
+                )
+
         antigen_chains: dict[str, dict[str, str]] = {}
-        instance_ids: list[str] = []
+        candidate_interfaces: set[tuple[str, str]] = set()
+        interface_metadata: dict[tuple[str, str], dict[str, str]] = {}
+        ligand_label_ids: set[str] = set()
+        for record in index_records_by_pdb.get(pdb_id, ()):
+            if record.record_type != "interface":
+                continue
+            side_1_chains = entity_to_uni.get(record.entity_1_id, set())
+            side_2_chains = entity_to_uni.get(record.entity_2_id, set())
+            if not side_1_chains or not side_2_chains:
+                missing_entities = [
+                    entity
+                    for entity, chains in (
+                        (record.entity_1_id, side_1_chains),
+                        (record.entity_2_id, side_2_chains),
+                    )
+                    if not chains
+                ]
+                append_unresolved(
+                    unresolved,
+                    pdb_id,
+                    "val_entity_unmapped",
+                    "reference CIF has no chain for val entity ID(s): "
+                    + ",".join(missing_entities),
+                    chain_id=f"{record.chain_1_id},{record.chain_2_id}",
+                )
+                continue
+            side_1_antibodies = side_1_chains & antibody_chains.keys()
+            side_2_antibodies = side_2_chains & antibody_chains.keys()
+            if bool(side_1_antibodies) == bool(side_2_antibodies):
+                continue
+            if side_1_antibodies:
+                ab_entity, ag_entity = record.entity_1_id, record.entity_2_id
+                ab_val_chain, ag_val_chain = record.chain_1_id, record.chain_2_id
+                ab_chains, ag_chains = side_1_antibodies, side_2_chains
+            else:
+                ab_entity, ag_entity = record.entity_2_id, record.entity_1_id
+                ab_val_chain, ag_val_chain = record.chain_2_id, record.chain_1_id
+                ab_chains, ag_chains = side_2_antibodies, side_1_chains
+            audit = {
+                "val_antibody_entity_id": ab_entity,
+                "val_antigen_entity_id": ag_entity,
+                "val_antibody_chain_ids": ab_val_chain,
+                "val_antigen_chain_ids": ag_val_chain,
+                "val_cluster_ids": record.cluster_id,
+                "val_eval_types": record.eval_type,
+                "positioning_source": "val_entity_id+anarcii",
+                **sabdab_metadata,
+            }
+            for antigen_chain in ag_chains:
+                details = antigen_chains.setdefault(
+                    antigen_chain, dict(chain_details[antigen_chain])
+                )
+                merge_audit_metadata(details, audit)
+                if details["entity_type"] == LIGAND:
+                    label_id = details["label_asym_id"]
+                    expanded = label_to_uni.get(label_id, set())
+                    if len(expanded) != 1:
+                        append_unresolved(
+                            unresolved,
+                            pdb_id,
+                            "ligand_assembly_ambiguous",
+                            f"label_asym_id {label_id} expands to {len(expanded)} chains",
+                            chain_id=antigen_chain,
+                        )
+                        continue
+                    try:
+                        pocket_valid = ligand_has_pxmeter_pocket(
+                            structure, antigen_chain
+                        )
+                    except Exception as exc:
+                        append_unresolved(
+                            unresolved,
+                            pdb_id,
+                            "ligand_pocket_check_failed",
+                            str(exc),
+                            chain_id=antigen_chain,
+                        )
+                        continue
+                    if not pocket_valid:
+                        append_unresolved(
+                            unresolved,
+                            pdb_id,
+                            "ligand_pocket_invalid",
+                            "fewer than three polymer backbone atoms form a 10 A pocket",
+                            chain_id=antigen_chain,
+                        )
+                        continue
+                    ligand_label_ids.add(label_id)
+                    continue
+                for antibody_chain in ab_chains:
+                    if antibody_chain == antigen_chain:
+                        continue
+                    pair = tuple(sorted((antibody_chain, antigen_chain)))
+                    candidate_interfaces.add(pair)
+                    metadata = interface_metadata.setdefault(pair, {})
+                    merge_audit_metadata(metadata, audit)
+
+        # SAbDab 缺少抗原链元数据不会覆盖 val+ANARCII 的结构定位结果。
         for instance in instances:
-            instance_ids.append(instance.instance_id)
             if not instance.antigen_chains:
                 append_unresolved(
                     unresolved,
@@ -654,144 +984,30 @@ def prepare_antibody_targets(
                 )
                 continue
 
-            for expected_chain, expected_role in (
-                *((chain, "antibody_heavy") for chain in instance.heavy_chains),
-                *((chain, "antibody_light") for chain in instance.light_chains),
-            ):
-                mapped = auth_to_uni.get(expected_chain, set())
-                if not mapped:
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "sabdab_antibody_chain_unmapped",
-                        "SAbDab antibody chain is absent from the selected assembly",
-                        instance_id=instance.instance_id,
-                        chain_id=expected_chain,
-                    )
-                elif not any(
-                    antibody_chains.get(chain_id, "").startswith(expected_role)
-                    or antibody_chains.get(chain_id) == "antibody_scfv"
-                    for chain_id in mapped
-                ):
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "sabdab_anarcii_role_conflict",
-                        f"SAbDab {expected_role} chain was not assigned that role by ANARCII",
-                        instance_id=instance.instance_id,
-                        chain_id=expected_chain,
-                    )
-
-            for antigen_auth_id in instance.antigen_chains:
-                mapped = set(auth_to_uni.get(antigen_auth_id, set()))
-                mapping_source = "auth_asym_id"
-                if not mapped:
-                    mapped = set(label_to_uni.get(antigen_auth_id, set()))
-                    mapping_source = "label_asym_id_fallback"
-                if not mapped:
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "antigen_chain_unmapped",
-                        "SAbDab antigen chain is absent from the selected assembly",
-                        instance_id=instance.instance_id,
-                        chain_id=antigen_auth_id,
-                    )
-                    continue
-                for chain_id in mapped:
-                    details = dict(chain_details[chain_id])
-                    details.update(
-                        {
-                            "sabdab_auth_chain": antigen_auth_id,
-                            "sabdab_antigen_types": "|".join(instance.antigen_types),
-                            "mapping_source": mapping_source,
-                            "instance_id": instance.instance_id,
-                        }
-                    )
-                    existing = antigen_chains.get(chain_id)
-                    if existing is None:
-                        antigen_chains[chain_id] = details
-                    else:
-                        existing_types = split_sabdab_tokens(
-                            existing.get("sabdab_antigen_types")
-                        )
-                        existing_instances = split_sabdab_tokens(
-                            existing.get("instance_id")
-                        )
-                        existing["sabdab_antigen_types"] = "|".join(
-                            dict.fromkeys(existing_types + instance.antigen_types)
-                        )
-                        existing["instance_id"] = "|".join(
-                            dict.fromkeys(existing_instances + (instance.instance_id,))
-                        )
-
-        candidate_interfaces: set[tuple[str, str]] = set()
-        ligand_label_ids: set[str] = set()
-        for antigen_chain, details in antigen_chains.items():
-            if details["entity_type"] == LIGAND:
-                label_id = details["label_asym_id"]
-                expanded = label_to_uni.get(label_id, set())
-                if len(expanded) != 1:
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "ligand_assembly_ambiguous",
-                        f"label_asym_id {label_id} expands to {len(expanded)} chains",
-                        instance_id=details["instance_id"],
-                        chain_id=antigen_chain,
-                    )
-                    continue
-                try:
-                    pocket_valid = ligand_has_pxmeter_pocket(
-                        structure, antigen_chain
-                    )
-                except Exception as exc:
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "ligand_pocket_check_failed",
-                        str(exc),
-                        instance_id=details["instance_id"],
-                        chain_id=antigen_chain,
-                    )
-                    continue
-                if not pocket_valid:
-                    append_unresolved(
-                        unresolved,
-                        pdb_id,
-                        "ligand_pocket_invalid",
-                        "fewer than three polymer backbone atoms form a 10 A pocket",
-                        instance_id=details["instance_id"],
-                        chain_id=antigen_chain,
-                    )
-                    continue
-                ligand_label_ids.add(label_id)
-            else:
-                for antibody_chain in antibody_chains:
-                    if antibody_chain != antigen_chain:
-                        candidate_interfaces.add(
-                            tuple(sorted((antibody_chain, antigen_chain)))
-                        )
-
-        sabdab_type_set = sorted(
-            {
-                antigen_type
-                for instance in instances
-                for antigen_type in instance.antigen_types
-            }
-        )
         for chain_id, details in chain_details.items():
             antigen = antigen_chains.get(chain_id)
+            audit = entity_audit.get(details["entity_id"], {})
+            exact_sabdab_antigen = any(
+                chain_id in auth_to_uni.get(author_chain, set())
+                for author_chain in sabdab_antigens
+            )
             annotation_rows.append(
                 {
                     "pdb_id": pdb_id,
                     **details,
-                    "is_sabdab_antigen": str(antigen is not None),
-                    "sabdab_instances": "|".join(dict.fromkeys(instance_ids)),
-                    "sabdab_antigen_types": "|".join(sabdab_type_set),
-                    "antigen_mapping_source": (
-                        antigen.get("mapping_source", "") if antigen else ""
-                    ),
+                    **audit,
+                    "is_val_antigen": str(antigen is not None),
+                    "is_sabdab_antigen": str(exact_sabdab_antigen),
+                    "val_antibody_entity_id": antigen.get(
+                        "val_antibody_entity_id", ""
+                    ) if antigen else "",
+                    "val_antigen_entity_id": antigen.get(
+                        "val_antigen_entity_id", ""
+                    ) if antigen else "",
+                    "positioning_source": antigen.get(
+                        "positioning_source", ""
+                    ) if antigen else "",
+                    **sabdab_metadata,
                 }
             )
 
@@ -806,6 +1022,8 @@ def prepare_antibody_targets(
                 candidate_interfaces=candidate_interfaces,
                 ligand_label_asym_ids=ligand_label_ids,
                 sabdab_instances=tuple(dict.fromkeys(instance_ids)),
+                interface_metadata=interface_metadata,
+                sabdab_metadata=sabdab_metadata,
             )
             for label_id in sorted(ligand_label_ids):
                 internal_ligand_rows.append(
@@ -1284,12 +1502,13 @@ def build_antibody_subset_and_details(
                 chain_id=",".join(pair),
             )
         for chain_1, chain_2 in sorted(selected_interfaces):
-            subset[("interface", pdb_id, chain_1, chain_2)] = {
+            subset_row = {
                 "type": "interface",
                 "entry_id": pdb_id,
                 "chain_id_1": chain_1,
                 "chain_id_2": chain_2,
             }
+            subset[("interface", pdb_id, chain_1, chain_2)] = subset_row
         for chain_id in sorted(target.antibody_chains):
             if chain_id in actual_chains:
                 subset[("chain", pdb_id, chain_id, "")] = {
@@ -1320,6 +1539,9 @@ def build_antibody_subset_and_details(
                 )
                 antibody_chain = chain_2 if antigen_chain == chain_1 else chain_1
                 antigen = target.antigen_chains.get(antigen_chain, {})
+                audit = target.interface_metadata.get(
+                    tuple(sorted((chain_1, chain_2))), {}
+                )
                 row: dict[str, Any] = {
                     "entry_id": pdb_id,
                     "seed": seed,
@@ -1332,6 +1554,8 @@ def build_antibody_subset_and_details(
                     "sabdab_antigen_types": antigen.get(
                         "sabdab_antigen_types", ""
                     ),
+                    **target.sabdab_metadata,
+                    **audit,
                     "lddt": values.get("lddt"),
                     "bb_lddt": values.get("bb_lddt"),
                     "dockq": values.get("dockq"),
@@ -1366,6 +1590,19 @@ def build_antibody_subset_and_details(
                         "sabdab_antigen_types": antigen.get(
                             "sabdab_antigen_types", ""
                         ),
+                        **target.sabdab_metadata,
+                        **{
+                            key: antigen.get(key, "")
+                            for key in (
+                                "val_antibody_entity_id",
+                                "val_antigen_entity_id",
+                                "val_antibody_chain_ids",
+                                "val_antigen_chain_ids",
+                                "val_cluster_ids",
+                                "val_eval_types",
+                                "positioning_source",
+                            )
+                        },
                         "lig_rmsd": values.get("lig_rmsd"),
                         "pocket_rmsd": values.get("pocket_rmsd"),
                         "lddt_pli": values.get("lddt_pli"),
@@ -1420,6 +1657,11 @@ def run(args: argparse.Namespace) -> int:
     antibody_mode = args.sabdab_summary_csv is not None
     sabdab_by_pdb = (
         load_sabdab_instances(args.sabdab_summary_csv) if antibody_mode else {}
+    )
+    index_records_by_pdb = (
+        load_target_index_records(batch_info.indices_csv, batch_info.pdb_ids)
+        if antibody_mode
+        else {}
     )
     if antibody_mode:
         add_pxmeter_to_current_process(pxmeter_root)
@@ -1484,12 +1726,8 @@ def run(args: argparse.Namespace) -> int:
                 ref_view_dir,
                 batch_info.ref_assembly_id,
                 sabdab_by_pdb,
+                index_records_by_pdb,
             )
-            if not antibody_targets:
-                raise ConfigurationError(
-                    "SAbDab antibody mode found no target with both an ANARCII "
-                    "antibody and a mapped curated antigen"
-                )
             antibody_dir.mkdir(parents=True)
             write_csv(
                 antibody_dir / "annotations.csv",
@@ -1502,13 +1740,36 @@ def run(args: argparse.Namespace) -> int:
                     "entity_type",
                     "anarcii_type",
                     "role",
+                    "is_val_antigen",
                     "is_sabdab_antigen",
+                    "val_chain_ids",
+                    "val_mol_types",
+                    "val_cluster_ids",
+                    "val_eval_types",
+                    "val_record_types",
+                    "val_antibody_entity_id",
+                    "val_antigen_entity_id",
+                    "positioning_source",
                     "sabdab_instances",
+                    "sabdab_heavy_chains",
+                    "sabdab_light_chains",
+                    "sabdab_antigen_chains",
                     "sabdab_antigen_types",
-                    "antigen_mapping_source",
+                    "sabdab_chain_mapping_status",
+                    "sabdab_unresolved_chains",
                 ),
                 annotation_rows,
             )
+            if not antibody_targets:
+                reason_summary = publish_unresolved_diagnostics(
+                    unresolved_rows,
+                    antibody_dir / "unresolved.csv",
+                    args.output_root,
+                )
+                raise ConfigurationError(
+                    "SAbDab antibody mode found no val entity + ANARCII target; "
+                    f"unresolved.csv was published. Reasons: {reason_summary or 'none'}"
+                )
             write_csv(
                 antibody_dir / "ligand_info.csv",
                 ("entry_id", "label_asym_id"),
@@ -1609,7 +1870,20 @@ def run(args: argparse.Namespace) -> int:
                         "antibody_role",
                         "antigen_chain",
                         "antigen_entity_type",
+                        "val_antibody_entity_id",
+                        "val_antigen_entity_id",
+                        "val_antibody_chain_ids",
+                        "val_antigen_chain_ids",
+                        "val_cluster_ids",
+                        "val_eval_types",
+                        "positioning_source",
+                        "sabdab_instances",
+                        "sabdab_heavy_chains",
+                        "sabdab_light_chains",
+                        "sabdab_antigen_chains",
                         "sabdab_antigen_types",
+                        "sabdab_chain_mapping_status",
+                        "sabdab_unresolved_chains",
                         "lddt",
                         "bb_lddt",
                         "dockq",
