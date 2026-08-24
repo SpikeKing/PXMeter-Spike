@@ -90,6 +90,12 @@ CDR_BACKBONE_METRICS = (
 )
 
 
+def pxmeter_seed_dir(seed: int) -> str:
+    """Return the seed directory name emitted by PXMeter's Protenix evaluator."""
+
+    return str(seed)
+
+
 @dataclass(frozen=True)
 class BatchInfo:
     """批量推理产生的、评估完整性检查所需的元数据。"""
@@ -1359,7 +1365,7 @@ def postprocess_cdr_metrics(
                     metrics_path = (
                         per_sample_dir
                         / pdb_id
-                        / f"seed_{seed}"
+                        / pxmeter_seed_dir(seed)
                         / f"sample_{sample}_metrics.json"
                     )
                     pred_cif = (
@@ -1480,7 +1486,7 @@ def build_antibody_subset_and_details(
                 path = (
                     per_sample_dir
                     / pdb_id
-                    / f"seed_{seed}"
+                    / pxmeter_seed_dir(seed)
                     / f"sample_{sample}_metrics.json"
                 )
                 with path.open("r", encoding="utf-8") as handle:
