@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import math
 import os
@@ -68,6 +69,8 @@ OPTIONAL_OUTPUT_FILENAMES = (
     "RMSD_cdr_pdb_inst.csv",
 )
 MANAGED_OUTPUT_FILENAMES = OUTPUT_FILENAMES + OPTIONAL_OUTPUT_FILENAMES
+PDB_OUTPUT_DIRNAME = "pdbs"
+PDB_EXPORT_COUNT_KEY = "PDB结构文件"
 
 DETAIL_REQUIRED_COLUMNS = {
     "name",
@@ -230,6 +233,13 @@ class SelectedInterface:
     candidate: SampleCandidate
     dockq: float
     selection_score: float
+
+
+@dataclass(frozen=True)
+class PdbStructureExport:
+    source: Path
+    filename: str
+    decompress_gzip: bool = False
 
 
 def canonical_pair(chain_1: str, chain_2: str) -> tuple[str, str]:
@@ -885,12 +895,110 @@ def write_csv(
         os.fsync(handle.fileno())
 
 
+def build_pdb_structure_exports(
+    pred_dir: Path,
+    ref_dir: Path,
+    pdb_rows: Sequence[Mapping[str, Any]],
+) -> list[PdbStructureExport]:
+    pred_dir = pred_dir.expanduser().resolve()
+    ref_dir = ref_dir.expanduser().resolve()
+    if not pred_dir.is_dir():
+        raise SimplifyError(f"Prediction directory does not exist: {pred_dir}")
+    if not ref_dir.is_dir():
+        raise SimplifyError(f"Reference directory does not exist: {ref_dir}")
+
+    suffix_by_method = {
+        ORACLE: "_oracle.cif",
+        PREDICTED_BEST: ".pbest.cif",
+    }
+    exports: list[PdbStructureExport] = []
+    seen_destinations: set[str] = set()
+    for row in pdb_rows:
+        entry_id = str(row["PDB编号"])
+        if not entry_id or Path(entry_id).name != entry_id or entry_id in {".", ".."}:
+            raise SimplifyError(
+                f"Invalid PDB identifier for structure export: {entry_id!r}"
+            )
+        method = str(row["选择方式"])
+        suffix = suffix_by_method.get(method)
+        if suffix is None:
+            raise SimplifyError(f"Unsupported PDB selection method: {method!r}")
+        try:
+            seed = int(row["seed"])
+            sample = int(row["sample"])
+        except (TypeError, ValueError) as exc:
+            raise SimplifyError(
+                f"Invalid seed/sample for PDB structure export: {entry_id}"
+            ) from exc
+
+        source = (
+            pred_dir
+            / entry_id
+            / f"seed_{seed}"
+            / "predictions"
+            / f"{entry_id}_sample_{sample}.cif"
+        )
+        if not source.is_file():
+            raise SimplifyError(
+                f"Missing selected PDB structure for {entry_id} ({method}): {source}"
+            )
+        filename = f"{entry_id}{suffix}"
+        if filename in seen_destinations:
+            raise SimplifyError(f"Duplicate PDB structure destination: {filename}")
+        seen_destinations.add(filename)
+        exports.append(PdbStructureExport(source=source, filename=filename))
+
+    for entry_id in sorted({str(row["PDB编号"]) for row in pdb_rows}):
+        plain_source = ref_dir / f"{entry_id}.cif"
+        compressed_source = ref_dir / f"{entry_id}.cif.gz"
+        if plain_source.is_file():
+            source = plain_source
+            decompress_gzip = False
+        elif compressed_source.is_file():
+            source = compressed_source
+            decompress_gzip = True
+        else:
+            raise SimplifyError(
+                f"Missing ground-truth PDB structure for {entry_id}: "
+                f"expected {plain_source} or {compressed_source}"
+            )
+        filename = f"{entry_id}.gt.cif"
+        if filename in seen_destinations:
+            raise SimplifyError(f"Duplicate PDB structure destination: {filename}")
+        seen_destinations.add(filename)
+        exports.append(
+            PdbStructureExport(
+                source=source,
+                filename=filename,
+                decompress_gzip=decompress_gzip,
+            )
+        )
+    return exports
+
+
+def remove_published_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def copy_pdb_structure(export: PdbStructureExport, destination: Path) -> None:
+    if export.decompress_gzip:
+        with gzip.open(export.source, "rb") as source, destination.open("wb") as target:
+            shutil.copyfileobj(source, target)
+        shutil.copystat(export.source, destination)
+    else:
+        shutil.copy2(export.source, destination)
+
+
 def publish_csv_bundle(
     output_dir: Path,
     tables: Mapping[str, tuple[Sequence[str], Sequence[Mapping[str, Any]]]],
+    pdb_exports: Sequence[PdbStructureExport],
 ) -> None:
-    # 先在同一文件系统的临时目录写完所有 CSV，再逐个原子替换；
-    # 任何一步失败都恢复旧文件，避免产生新旧混合的报表集。
+    # 先在同一文件系统的临时目录写完所有 CSV 和 CIF，再逐个
+    # 原子替换；任何一步失败都恢复旧输出，避免产生新旧混合的结果集。
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     staging = Path(
@@ -904,12 +1012,19 @@ def publish_csv_bundle(
                 continue
             columns, rows = tables[filename]
             write_csv(staging / filename, columns, rows)
+        staged_pdb_dir = staging / PDB_OUTPUT_DIRNAME
+        staged_pdb_dir.mkdir()
+        for export in pdb_exports:
+            copy_pdb_structure(export, staged_pdb_dir / export.filename)
         # 先备份所有受管文件。``tables`` 未包含的是当前数据集不适用的
         # 可选指标；同步移除它们的旧版本，防止将过期结果误认为新结果。
-        for filename in MANAGED_OUTPUT_FILENAMES:
-            destination = output_dir / filename
+        managed_destinations = [
+            *(output_dir / filename for filename in MANAGED_OUTPUT_FILENAMES),
+            output_dir / PDB_OUTPUT_DIRNAME,
+        ]
+        for destination in managed_destinations:
             if destination.exists():
-                backup = output_dir / f".{filename}.backup.{uuid.uuid4().hex}"
+                backup = output_dir / (f".{destination.name}.backup.{uuid.uuid4().hex}")
                 os.replace(destination, backup)
                 backups[destination] = backup
         for filename in MANAGED_OUTPUT_FILENAMES:
@@ -918,16 +1033,19 @@ def publish_csv_bundle(
             destination = output_dir / filename
             os.replace(staging / filename, destination)
             published.append(destination)
+        pdb_destination = output_dir / PDB_OUTPUT_DIRNAME
+        os.replace(staged_pdb_dir, pdb_destination)
+        published.append(pdb_destination)
     except Exception:
         for destination in reversed(published):
-            destination.unlink(missing_ok=True)
+            remove_published_path(destination)
         for destination, backup in backups.items():
             if backup.exists():
                 os.replace(backup, destination)
         raise
     else:
         for backup in backups.values():
-            backup.unlink(missing_ok=True)
+            remove_published_path(backup)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -2440,11 +2558,19 @@ def build_optional_metric_tables(
     return tables
 
 
-def build_reports(input_dir: Path, output_dir: Path) -> dict[str, int]:
+def build_reports(
+    input_dir: Path, pred_dir: Path, ref_dir: Path, output_dir: Path
+) -> dict[str, int]:
     input_dir = input_dir.expanduser().resolve()
+    pred_dir = pred_dir.expanduser().resolve()
+    ref_dir = ref_dir.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     if not input_dir.is_dir():
         raise SimplifyError(f"Input directory does not exist: {input_dir}")
+    if not pred_dir.is_dir():
+        raise SimplifyError(f"Prediction directory does not exist: {pred_dir}")
+    if not ref_dir.is_dir():
+        raise SimplifyError(f"Reference directory does not exist: {ref_dir}")
 
     main_details = input_dir / "summary" / "DockQ_details.csv"
     antibody_details = input_dir / "antibody" / "summary" / "DockQ_details.csv"
@@ -2496,6 +2622,7 @@ def build_reports(input_dir: Path, output_dir: Path) -> dict[str, int]:
     pdb_inst = build_pdb_inst_rows(prot_predicted_definitions, candidates)
     pdb_inst.sort(key=lambda row: (row["PDB编号"], METHOD_ORDER[str(row["选择方式"])]))
     pdb_sum = build_pdb_sum_rows(pdb_inst)
+    pdb_exports = build_pdb_structure_exports(pred_dir, ref_dir, pdb_inst)
     abag_inst, abag_groups = build_abag_rows(abag_selected, abag_subset, abag_roles)
     abag_inst.sort(
         key=lambda row: (
@@ -2517,19 +2644,36 @@ def build_reports(input_dir: Path, output_dir: Path) -> dict[str, int]:
         "DockQ_abag_interface_inst.csv": (ABAG_INST_COLUMNS, abag_inst),
     }
     tables.update(build_optional_metric_tables(input_dir))
-    publish_csv_bundle(output_dir, tables)
-    return {filename: len(rows) for filename, (_, rows) in tables.items()}
+    publish_csv_bundle(output_dir, tables, pdb_exports)
+    counts = {filename: len(rows) for filename, (_, rows) in tables.items()}
+    counts[PDB_EXPORT_COUNT_KEY] = len(pdb_exports)
+    return counts
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="生成只包含 Oracle 与预测排序最佳的 DockQ/LDDT/RMSD 精简中文汇总。"
+        description=(
+            "生成只包含 Oracle 与预测排序最佳的 DockQ/LDDT/RMSD "
+            "精简中文汇总和 PDB 结构。"
+        )
     )
     parser.add_argument(
         "--input-dir",
         type=Path,
         default=DEFAULT_INPUT_DIR,
         help=f"PXMeter 评估根目录（默认：{DEFAULT_INPUT_DIR}）。",
+    )
+    parser.add_argument(
+        "--pred-dir",
+        required=True,
+        type=Path,
+        help="batch_infer_indices.py 生成的 Protenix 原始预测根目录。",
+    )
+    parser.add_argument(
+        "--ref-dir",
+        required=True,
+        type=Path,
+        help="真实参考结构目录，支持 <PDB>.cif 和 <PDB>.cif.gz。",
     )
     parser.add_argument(
         "--output-dir",
@@ -2544,7 +2688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     output_dir = args.output_dir or args.input_dir / "summary_simplify"
     try:
-        counts = build_reports(args.input_dir, output_dir)
+        counts = build_reports(args.input_dir, args.pred_dir, args.ref_dir, output_dir)
     except SimplifyError as exc:
         print(f"精简汇总失败：{exc}", file=sys.stderr)
         return 2
@@ -2552,6 +2696,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for filename in MANAGED_OUTPUT_FILENAMES:
         if filename in counts:
             print(f"  {filename}: {counts[filename]} 行")
+    print(f"  {PDB_OUTPUT_DIRNAME}/: {counts[PDB_EXPORT_COUNT_KEY]} 个 CIF")
     return 0
 
 
