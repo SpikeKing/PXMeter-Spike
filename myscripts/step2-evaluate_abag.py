@@ -1272,72 +1272,74 @@ def run_evaluation_shards(
     env: dict[str, str],
     extra_arguments: Sequence[str] = (),
 ) -> None:
-    """Evaluate one seed wave at a time with one subprocess per target.
+    """Evaluate target/seed combinations with one subprocess per combination.
 
     Each PXMeter subprocess receives one target/seed and ``-n 1``. Thus loky
-    is not used for heavy sample evaluation, at most one process per target is
-    resident, and native allocations are reclaimed when the subprocess exits.
+    is not used for heavy sample evaluation, and native allocations are
+    reclaimed when the subprocess exits.
     """
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     aliases = tuple(sorted(aliases))
     seeds = tuple(seeds)
-    max_workers = max(1, min(requested_workers, len(aliases)))
+    tasks = tuple((alias, seed) for seed in seeds for alias in aliases)
+    max_workers = max(1, min(requested_workers, len(tasks)))
     LOGGER.info(
-        "开始结构评估：共 %d 个目标与 seed 组合，并发数 %d（请求 %d，目标数 %d）",
-        len(aliases) * len(seeds),
+        "开始结构评估：共 %d 个目标与 seed 组合，并发数 %d（请求 %d，"
+        "目标数 %d，seed 数 %d）",
+        len(tasks),
         max_workers,
         requested_workers,
         len(aliases),
+        len(seeds),
     )
 
     with tqdm(
-        total=len(aliases) * len(seeds),
+        total=len(tasks),
         desc="PXMeter 单目标评估",
         unit="项",
         disable=not sys.stderr.isatty(),
     ) as progress:
-        for seed in seeds:
-            shard_inputs = {
-                alias: create_evaluation_shard_view(
-                    pred_view_dir, alias, seed, shard_root
-                )
-                for alias in aliases
+        shard_inputs = {
+            (alias, seed): create_evaluation_shard_view(
+                pred_view_dir, alias, seed, shard_root
+            )
+            for alias, seed in tasks
+        }
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    run_pxmeter_module,
+                    "benchmark.run_eval",
+                    (
+                        "-i",
+                        str(shard_input),
+                        "-o",
+                        str(per_sample_dir),
+                        "-m",
+                        "protenix",
+                        "-r",
+                        ref_assembly_id,
+                        "-n",
+                        "1",
+                        *extra_arguments,
+                    ),
+                    env,
+                    quiet=True,
+                ): (alias, seed)
+                for (alias, seed), shard_input in shard_inputs.items()
             }
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        run_pxmeter_module,
-                        "benchmark.run_eval",
-                        (
-                            "-i",
-                            str(shard_input),
-                            "-o",
-                            str(per_sample_dir),
-                            "-m",
-                            "protenix",
-                            "-r",
-                            ref_assembly_id,
-                            "-n",
-                            "1",
-                            *extra_arguments,
-                        ),
-                        env,
-                        quiet=True,
-                    ): alias
-                    for alias, shard_input in shard_inputs.items()
-                }
-                for future in as_completed(futures):
-                    alias = futures[future]
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        raise EvaluationError(
-                            f"PXMeter 结构评估失败：目标={alias}，"
-                            f"seed={seed}：{exc}"
-                        ) from exc
-                    progress.update(1)
+            for future in as_completed(futures):
+                alias, seed = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    raise EvaluationError(
+                        f"PXMeter 结构评估失败：目标={alias}，"
+                        f"seed={seed}：{exc}"
+                    ) from exc
+                progress.update(1)
 
 
 def restore_pxmeter_target_ids(
