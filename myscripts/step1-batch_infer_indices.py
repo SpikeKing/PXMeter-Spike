@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""对一个索引 CSV 批量运行 Protenix，并输出 PXMeter 兼容目录。
+# Copyright 2025 ByteDance and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""对一个索引 CSV 批量运行 Protenix v1/v2，并输出 PXMeter 兼容目录。
 
 使用示例
 --------
@@ -8,6 +22,7 @@
     python myscripts/step1-batch_infer_indices.py \
       --indices-csv /data/protenix_data_sabdab2/indices/val.csv \
       --data-root /data/protenix_data_sabdab2 \
+      --model-name protenix_base_default_v1.0.0 \
       --checkpoint /data/my_runs/protenix_finetune_sabdab2.pt \
       --output-dir /data/my_runs/base_v1_val
 
@@ -17,23 +32,31 @@
       myscripts/step1-batch_infer_indices.py \
       --indices-csv /data/protenix_data_sabdab2/indices/test.csv \
       --data-root /data/protenix_data_sabdab2 \
-      --checkpoint /data/my_runs/protenix_finetune_sabdab2.pt \
-      --output-dir /data/my_runs/base_v1_test
+      --model-name protenix-v2 \
+      --checkpoint /data/protenix_models/protenix-v2.pt \
+      --output-dir /data/my_runs/protenix_v2_test
 
 ``--output-dir`` 指向的目录本身就是 PXMeter 在 ``-m protenix`` 模式下的
 ``infer_dir``。默认使用 5 个 seed（1、2、3、4、5），每个 seed 生成 5 个
-sample，因此每个 case 共生成 25 个候选结构。可用 ``--limit 1 --cycles 1
---steps 20 --samples 1 --seeds 1`` 做快速冒烟测试。
+sample，因此每个 case 共生成 25 个候选结构。默认使用 4 次 Pairformer recycle
+和 100 个扩散去噪步骤。可用 ``--limit 1 --cycles 1 --steps 20 --samples 1
+--seeds 1`` 做快速冒烟测试。
 
-``--checkpoint`` 可指向任意文件名的 Protenix base v1 官方或微调权重；文件名
-不参与模型架构选择。
+``--checkpoint`` 可指向任意文件名的官方或微调权重；模型架构由
+``--model-name`` 明确选择。Protenix-v2 会自动跳过超过 2560 tokens 的条目。
+
+执行流程：先校验数据、权重与输出目录的运行身份，再按
+``num_tokens²`` 将 PDB 均衡分配给各 GPU rank；每个 rank 按 seed
+独立推理并原子更新进度，最后由 rank 0 汇总全局状态。
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -44,7 +67,7 @@ import time
 import traceback
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 # 直接运行 ``python myscripts/step1-batch_infer_indices.py`` 时，Python 默认只把
@@ -54,7 +77,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-MODEL_NAME = "protenix_base_default_v1.0.0"
+DEFAULT_MODEL_NAME = "protenix_base_default_v1.0.0"
+SUPPORTED_MODEL_NAMES = (DEFAULT_MODEL_NAME, "protenix-v2")
+MODEL_TOKEN_LIMITS = {"protenix-v2": 2560}
 REQUIRED_CONFIDENCE_KEYS = {"ranking_score", "plddt", "ptm", "iptm"}
 LOGGER = logging.getLogger("batch_infer_indices")
 PROGRESS_DIR_NAME = ".batch_progress"
@@ -64,6 +89,7 @@ FINAL_STATUS_TIMEOUT_SECONDS = 600.0
 STAT_KEYS = ("assigned", "succeeded", "skipped", "failed")
 ASSIGNMENT_STRATEGY = "greedy_num_tokens_squared"
 OUTPUT_LOCK_NAME = ".batch_infer.lock"
+RUN_IDENTITY_NAME = ".batch_run_identity.json"
 
 
 class SafeFeatureDataset:
@@ -108,7 +134,7 @@ def make_prediction_input(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "读取一个 indices CSV，运行 Protenix base v1 推理，并输出 "
+            "读取一个 indices CSV，运行 Protenix v1/v2 推理，并输出 "
             "PXMeter 兼容的预测结果。"
         )
     )
@@ -119,10 +145,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--data-root", required=True, type=Path, help="Protenix 预处理数据根目录。"
     )
     parser.add_argument(
+        "--model-name",
+        choices=SUPPORTED_MODEL_NAMES,
+        default=DEFAULT_MODEL_NAME,
+        help=f"模型架构（默认：{DEFAULT_MODEL_NAME}）。",
+    )
+    parser.add_argument(
         "--checkpoint",
         required=True,
         type=Path,
-        help="Protenix base v1 官方或微调权重文件（文件名不限）。",
+        help="与 --model-name 架构匹配的官方或微调权重（文件名不限）。",
     )
     parser.add_argument(
         "--output-dir", required=True, type=Path, help="本次推理的 PXMeter 输入目录。"
@@ -132,8 +164,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="1,2,3,4,5",
         help="逗号分隔的整数随机种子（默认：1,2,3,4,5）。",
     )
-    parser.add_argument("--cycles", type=int, default=4, help="Pairformer 循环次数。")
-    parser.add_argument("--steps", type=int, default=100, help="扩散去噪步数。")
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=4,
+        help="Pairformer 循环次数（默认：4）。",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=100,
+        help="扩散去噪步数（默认：100）。",
+    )
     parser.add_argument("--samples", type=int, default=5, help="每个 seed 的候选数。")
     parser.add_argument(
         "--dtype",
@@ -148,7 +190,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-tokens",
         type=int,
         default=-1,
-        help="跳过超过该 token 数的条目；-1 表示不过滤。",
+        help=(
+            "跳过超过该 token 数的条目；-1 表示使用模型上限"
+            "（v2 为 2560，v1 不过滤）。"
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -254,6 +299,104 @@ def parse_seeds(raw: str) -> list[int]:
     return seeds
 
 
+def deep_update_dict(base: dict[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """递归合并模型配置，避免浅层 update 丢失未覆盖的嵌套默认值。"""
+
+    for key, value in overrides.items():
+        if (
+            isinstance(value, Mapping)
+            and key in base
+            and isinstance(base[key], Mapping)
+        ):
+            nested = dict(base[key])
+            base[key] = deep_update_dict(nested, value)
+        else:
+            base[key] = deepcopy(value)
+    return base
+
+
+def effective_max_tokens(model_name: str, requested: int) -> int:
+    """应用模型硬上限，同时允许用户请求更严格的过滤。"""
+
+    model_limit = MODEL_TOKEN_LIMITS.get(model_name)
+    if model_limit is None:
+        return requested
+    if requested == -1 or requested > model_limit:
+        return model_limit
+    return requested
+
+
+def filtered_pdb_ids_from_csv(indices_csv: Path, max_tokens: int) -> tuple[list[str], bool]:
+    """从标准 indices CSV 统计会被 token 上限过滤的 PDB。"""
+
+    if max_tokens == -1:
+        return [], True
+    with indices_csv.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or ())
+        pdb_column = next(
+            (name for name in ("pdb_id", "entry_id") if name in fieldnames),
+            None,
+        )
+        if pdb_column is None or "num_tokens" not in fieldnames:
+            return [], False
+        filtered = set()
+        for row in reader:
+            try:
+                num_tokens = int(float(row["num_tokens"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            pdb_id = str(row.get(pdb_column, "")).strip()
+            if pdb_id and num_tokens > max_tokens:
+                filtered.add(pdb_id)
+    return sorted(filtered), True
+
+
+def checkpoint_sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """计算 checkpoint 内容指纹；仅由 rank 0 在持有输出锁时调用。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_checkpoint_state_dict(checkpoint: Any) -> dict[str, Any]:
+    """校验 Protenix checkpoint，并移除可选的 DDP ``module.`` 前缀。"""
+
+    if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
+        raise ValueError("Checkpoint must be a mapping containing a 'model' state dict")
+    state_dict = checkpoint["model"]
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("Checkpoint 'model' must be a non-empty state dict")
+    normalized = dict(state_dict)
+    if all(str(key).startswith("module.") for key in normalized):
+        normalized = {
+            str(key)[len("module.") :]: value
+            for key, value in normalized.items()
+        }
+    return normalized
+
+
+def load_state_dict_strict(
+    model: Any,
+    state_dict: Mapping[str, Any],
+    checkpoint_path: Path,
+    model_name: str,
+) -> None:
+    """严格加载权重，并将尺寸不匹配转换成可操作的模型选择错误。"""
+
+    try:
+        model.load_state_dict(state_dict=dict(state_dict), strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is incompatible with model "
+            f"{model_name!r}; verify that --model-name matches the checkpoint "
+            "architecture."
+        ) from exc
+
+
 def require_readable_file(path: Path, label: str) -> Path:
     """返回规范化绝对路径，并确认文件存在且可读。"""
 
@@ -283,7 +426,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         ("steps", args.steps),
         ("samples", args.samples),
     ):
-        if value <= 0:
+        if value is not None and value <= 0:
             raise ValueError(f"--{name} must be a positive integer, got {value}")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
@@ -291,6 +434,13 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--max-tokens must be -1 or a positive integer")
     if args.limit == 0 or args.limit < -1:
         raise ValueError("--limit must be -1 or a positive integer")
+
+    args.requested_max_tokens = args.max_tokens
+    args.max_tokens = effective_max_tokens(args.model_name, args.max_tokens)
+    (
+        args.filtered_over_token_limit,
+        args.token_filter_audit_available,
+    ) = filtered_pdb_ids_from_csv(args.indices_csv, args.max_tokens)
 
     # CCD、聚类文件和预处理后的 bioassembly 是任何模式都需要的基础数据。
     required_files = [
@@ -361,8 +511,6 @@ def configure_environment(args: argparse.Namespace) -> None:
 def build_configs(args: argparse.Namespace) -> Any:
     """合并基础、模型和命令行配置，生成推理 runner 所需配置。"""
 
-    from ml_collections.config_dict import ConfigDict
-
     from configs.configs_base import configs as configs_base
     from configs.configs_data import data_configs
     from configs.configs_inference import inference_configs
@@ -370,21 +518,32 @@ def build_configs(args: argparse.Namespace) -> Any:
     from protenix.config.config import parse_configs
     from runner.inference import update_gpu_compatible_configs
 
-    # 先解析全量默认配置，再覆盖本脚本明确暴露的推理参数。
-    raw_configs = {
-        **configs_base,
-        **{"data": data_configs},
-        **inference_configs,
-    }
+    if args.model_name not in model_configs:
+        raise ValueError(
+            f"Installed Protenix does not support {args.model_name!r}. "
+            "Install Protenix >= 2.0.0 or use a matching source checkout."
+        )
+
+    # 必须在 parse_configs 前深度合并。v2 会覆盖 c_z 等深层架构参数，浅层
+    # ConfigDict.update 会把整个 model 子树替换掉并丢失其余默认配置。
+    raw_configs = deepcopy(
+        {
+            **configs_base,
+            **{"data": data_configs},
+            **inference_configs,
+        }
+    )
+    deep_update_dict(raw_configs, model_configs[args.model_name])
     configs = parse_configs(raw_configs, fill_required_with_null=True)
-    configs.update(ConfigDict(model_configs[MODEL_NAME]))
-    configs.model_name = MODEL_NAME
+    configs.model_name = args.model_name
     configs.load_checkpoint_path = str(args.checkpoint)
     configs.load_checkpoint_dir = str(args.checkpoint.parent)
     configs.dump_dir = str(args.output_dir)
     configs.seeds = args.seeds
-    configs.model.N_cycle = args.cycles
-    configs.sample_diffusion.N_step = args.steps
+    if args.cycles is not None:
+        configs.model.N_cycle = args.cycles
+    if args.steps is not None:
+        configs.sample_diffusion.N_step = args.steps
     configs.sample_diffusion.N_sample = args.samples
     configs.dtype = args.dtype
     configs.use_msa = args.use_msa
@@ -400,7 +559,11 @@ def build_configs(args: argparse.Namespace) -> Any:
     configs.data.num_dl_workers = args.num_workers
     if args.use_template:
         configs.data.template.kalign_binary_path = str(args.kalign_binary)
-    return update_gpu_compatible_configs(configs)
+    configs.load_strict = True
+    configs = update_gpu_compatible_configs(configs)
+    args.effective_cycles = int(configs.model.N_cycle)
+    args.effective_steps = int(configs.sample_diffusion.N_step)
+    return configs
 
 
 def build_dataset(args: argparse.Namespace, configs: Any) -> Any:
@@ -902,6 +1065,94 @@ def write_json_atomic(path: Path, data: Any) -> None:
     temporary.replace(path)
 
 
+def make_run_identity(args: argparse.Namespace) -> dict[str, Any]:
+    """构造会影响输出内容或断点续跑判定的稳定运行身份。"""
+
+    checkpoint_stat = args.checkpoint.stat()
+    return {
+        "schema_version": 1,
+        "model_name": args.model_name,
+        "checkpoint": {
+            "path": str(args.checkpoint),
+            "size": checkpoint_stat.st_size,
+            "sha256": checkpoint_sha256(args.checkpoint),
+        },
+        "indices_csv": str(args.indices_csv),
+        "data_root": str(args.data_root),
+        "seeds": args.seeds,
+        "samples": args.samples,
+        "cycles": args.effective_cycles,
+        "steps": args.effective_steps,
+        "dtype": args.dtype,
+        "max_tokens": args.max_tokens,
+        "limit": args.limit,
+        "use_msa": args.use_msa,
+        "use_rna_msa": args.use_rna_msa,
+        "use_template": args.use_template,
+        "triangle_multiplicative": args.triangle_multiplicative,
+        "triangle_attention": args.triangle_attention,
+        "enable_cache": args.enable_cache,
+        "enable_fusion": args.enable_fusion,
+        "enable_tf32": args.enable_tf32,
+    }
+
+
+def output_has_predictions(output_dir: Path) -> bool:
+    """判断目录是否已有可被本脚本复用或覆盖的预测结构。"""
+
+    return next(output_dir.glob("*/seed_*/predictions/*.cif"), None) is not None
+
+
+def clear_prediction_outputs(output_dir: Path) -> None:
+    """移除旧运行的 PDB 输出目录；仅在身份冲突且显式 overwrite 时调用。"""
+
+    pdb_dirs = {
+        cif_path.parents[2]
+        for cif_path in output_dir.glob("*/seed_*/predictions/*.cif")
+    }
+    for pdb_dir in sorted(pdb_dirs):
+        shutil.rmtree(pdb_dir)
+
+
+def ensure_run_identity(
+    output_dir: Path,
+    identity: dict[str, Any],
+    overwrite: bool,
+) -> None:
+    """阻止不同模型、权重或推理配置在同一目录中断点混用。"""
+
+    identity_path = output_dir / RUN_IDENTITY_NAME
+    existing = None
+    if identity_path.exists():
+        try:
+            with identity_path.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            if not overwrite:
+                raise ValueError(
+                    f"Invalid run identity file {identity_path}; use --overwrite "
+                    "to replace it."
+                ) from exc
+    elif output_has_predictions(output_dir):
+        if not overwrite:
+            raise ValueError(
+                f"Output directory {output_dir} contains predictions without a run "
+                "identity; use a new directory or pass --overwrite."
+            )
+        clear_prediction_outputs(output_dir)
+
+    if existing is not None and existing != identity and not overwrite:
+        raise ValueError(
+            f"Output directory {output_dir} belongs to a different model, "
+            "checkpoint, dataset, or inference configuration; use a new directory "
+            "or pass --overwrite."
+        )
+    if existing is not None and existing != identity and overwrite:
+        clear_prediction_outputs(output_dir)
+    if existing != identity:
+        write_json_atomic(identity_path, identity)
+
+
 @contextlib.contextmanager
 def output_directory_lock(output_dir: Path, enabled: bool = True):
     """阻止两个批任务同时修改同一输出目录。
@@ -1118,6 +1369,36 @@ def _run_unlocked(args: argparse.Namespace) -> int:
         update_inference_configs,
     )
 
+    class ExplicitCheckpointInferenceRunner(InferenceRunner):
+        """保持官方 Runner 行为，但严格使用命令行给出的 checkpoint 路径。"""
+
+        def load_checkpoint(self) -> None:
+            checkpoint_path = Path(self.configs.load_checkpoint_path)
+            self.print(
+                f"Loading {self.configs.model_name} from {checkpoint_path}, "
+                "strict: True"
+            )
+            try:
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location=self.device,
+                    weights_only=False,
+                )
+                state_dict = normalize_checkpoint_state_dict(checkpoint)
+                load_state_dict_strict(
+                    self.model,
+                    state_dict,
+                    checkpoint_path,
+                    self.configs.model_name,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load checkpoint {checkpoint_path} for model "
+                    f"{self.configs.model_name!r}: {exc}"
+                ) from exc
+            self.model.eval()
+            self.print("Finish loading checkpoint.")
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this Protenix batch inference script")
 
@@ -1139,10 +1420,18 @@ def _run_unlocked(args: argparse.Namespace) -> int:
     # 进入后续 collective，避免健康 rank 永久等待已经退出的 rank。
     configs = None
     dataset = None
+    run_identity = None
     initialization_error = None
     try:
         configs = build_configs(args)
         dataset = build_dataset(args, configs)
+        if rank == 0:
+            run_identity = make_run_identity(args)
+            ensure_run_identity(
+                args.output_dir,
+                run_identity,
+                overwrite=args.overwrite,
+            )
     except Exception:
         initialization_error = traceback.format_exc()
     write_initialization_state(progress_dir, rank, initialization_error)
@@ -1262,7 +1551,7 @@ def _run_unlocked(args: argparse.Namespace) -> int:
     if pending_indices:
         try:
             # 每个 torchrun rank 各加载一份模型，并绑定自己的 local_rank GPU。
-            runner = InferenceRunner(configs)
+            runner = ExplicitCheckpointInferenceRunner(configs)
         except Exception:
             stats["failed"] += len(pending_indices)
             append_jsonl(
@@ -1459,15 +1748,23 @@ def _run_unlocked(args: argparse.Namespace) -> int:
                 progress_monitor.stop()
         gathered, total_stats = aggregate_rank_stats(final_states)
         summary = {
-            "model": MODEL_NAME,
+            "model": args.model_name,
+            "checkpoint": run_identity["checkpoint"],
             "indices_csv": str(args.indices_csv),
             "pdb_ids": selected_pdb_ids(dataset),
+            "filtered_over_token_limit": {
+                "count": len(args.filtered_over_token_limit),
+                "pdb_ids": args.filtered_over_token_limit,
+                "audit_available": args.token_filter_audit_available,
+            },
             "ref_assembly_id": "1",
             "world_size": world_size,
             "seeds": args.seeds,
             "samples": args.samples,
-            "cycles": args.cycles,
-            "steps": args.steps,
+            "cycles": args.effective_cycles,
+            "steps": args.effective_steps,
+            "requested_max_tokens": args.requested_max_tokens,
+            "effective_max_tokens": args.max_tokens,
             "dtype": args.dtype,
             "use_msa": args.use_msa,
             "use_rna_msa": args.use_rna_msa,
@@ -1513,6 +1810,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = validate_args(parse_args(argv))
         configure_logging(args.log_level)
+        if args.requested_max_tokens != args.max_tokens:
+            LOGGER.info(
+                "%s enforces max_tokens=%d; requested value %d was adjusted",
+                args.model_name,
+                args.max_tokens,
+                args.requested_max_tokens,
+            )
+        if not args.token_filter_audit_available:
+            LOGGER.warning(
+                "Could not audit token-filtered PDB IDs because %s lacks "
+                "pdb_id/entry_id or num_tokens columns",
+                args.indices_csv,
+            )
         configure_environment(args)
         return run(args)
     except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError) as exc:

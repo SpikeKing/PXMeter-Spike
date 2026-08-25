@@ -173,3 +173,6 @@ output/
 matest/
 matest*
 ccd_cache/
+
+# my data
+mydata/
