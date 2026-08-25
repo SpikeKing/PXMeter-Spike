@@ -97,6 +97,7 @@ THREAD_LIMIT_ENV_VARS = (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 )
+CGROUP_V2_MEMORY_EVENTS = Path("/sys/fs/cgroup/memory.events")
 
 
 def pxmeter_seed_dir(seed: int) -> str:
@@ -151,6 +152,45 @@ def build_worker_plan(
         total_workers,
         total_workers,
     )
+
+
+def read_cgroup_memory_events() -> dict[str, int]:
+    """Read Linux cgroup-v2 OOM counters when they are available."""
+
+    try:
+        lines = CGROUP_V2_MEMORY_EVENTS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+
+    events: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            events[fields[0]] = int(fields[1])
+        except ValueError:
+            continue
+    return events
+
+
+def report_new_cgroup_memory_events(
+    before: dict[str, int], after: dict[str, int]
+) -> None:
+    """Distinguish a real cgroup OOM kill from loky's leak heuristic."""
+
+    increases = {
+        name: after.get(name, 0) - before.get(name, 0)
+        for name in ("oom", "oom_kill", "oom_group_kill")
+        if after.get(name, 0) > before.get(name, 0)
+    }
+    if increases:
+        LOGGER.warning(
+            "The evaluation caused cgroup memory event(s): %s. This is a real "
+            "container memory-pressure event, not a worker-timeout problem. "
+            "Reduce --num-cpu or increase the container memory limit if it recurs.",
+            ", ".join(f"{name}=+{count}" for name, count in increases.items()),
+        )
 
 
 @dataclass(frozen=True)
@@ -1206,6 +1246,104 @@ def create_target_prediction_view(
                     )
 
 
+def create_evaluation_shard_view(
+    pred_view_dir: Path,
+    alias: str,
+    seed: int,
+    shard_root: Path,
+) -> Path:
+    """Expose exactly one target/seed to one single-worker PXMeter process."""
+
+    input_dir = shard_root / f"{alias}__seed_{seed}"
+    target_dir = input_dir / alias
+    target_dir.mkdir(parents=True)
+    source_seed_dir = pred_view_dir / alias / f"seed_{seed}"
+    (target_dir / f"seed_{seed}").symlink_to(
+        source_seed_dir.resolve(), target_is_directory=True
+    )
+    return input_dir
+
+
+def run_evaluation_shards(
+    pred_view_dir: Path,
+    per_sample_dir: Path,
+    shard_root: Path,
+    aliases: Sequence[str],
+    seeds: Sequence[int],
+    ref_assembly_id: str,
+    requested_workers: int,
+    env: dict[str, str],
+    extra_arguments: Sequence[str] = (),
+) -> None:
+    """Evaluate one seed wave at a time with one subprocess per target.
+
+    Each PXMeter subprocess receives one target/seed and ``-n 1``. Thus loky
+    is not used for heavy sample evaluation, at most one process per target is
+    resident, and native allocations are reclaimed when the subprocess exits.
+    """
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    aliases = tuple(sorted(aliases))
+    seeds = tuple(seeds)
+    max_workers = max(1, min(requested_workers, len(aliases)))
+    LOGGER.info(
+        "Memory-safe PXMeter scheduling: target/seed processes=%d; "
+        "concurrent processes=%d (requested=%d, targets=%d); "
+        "PXMeter workers per process=1",
+        len(aliases) * len(seeds),
+        max_workers,
+        requested_workers,
+        len(aliases),
+    )
+
+    with tqdm(
+        total=len(aliases) * len(seeds),
+        desc="PXMeter 单目标评估",
+        unit="target/seed",
+        disable=not sys.stderr.isatty(),
+    ) as progress:
+        for seed in seeds:
+            shard_inputs = {
+                alias: create_evaluation_shard_view(
+                    pred_view_dir, alias, seed, shard_root
+                )
+                for alias in aliases
+            }
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        run_pxmeter_module,
+                        "benchmark.run_eval",
+                        (
+                            "-i",
+                            str(shard_input),
+                            "-o",
+                            str(per_sample_dir),
+                            "-m",
+                            "protenix",
+                            "-r",
+                            ref_assembly_id,
+                            "-n",
+                            "1",
+                            *extra_arguments,
+                        ),
+                        env,
+                    ): alias
+                    for alias, shard_input in shard_inputs.items()
+                }
+                for future in as_completed(futures):
+                    alias = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        raise EvaluationError(
+                            f"PXMeter evaluation failed for target={alias}, "
+                            f"seed={seed}: {exc}"
+                        ) from exc
+                    progress.update(1)
+
+
 def restore_pxmeter_target_ids(
     per_sample_dir: Path, alias_to_pdb_id: dict[str, str]
 ) -> None:
@@ -1892,7 +2030,8 @@ def run(args: argparse.Namespace) -> int:
     for variable in THREAD_LIMIT_ENV_VARS:
         os.environ[variable] = "1"
     LOGGER.info(
-        "Sequential stage workers: evaluation=%d, CDR=%d, aggregation=%d; "
+        "Stage worker ceilings: evaluation=%d (further capped by target count; "
+        "one PXMeter worker per target/seed process), CDR=%d, aggregation=%d; "
         "BLAS/OpenMP threads per worker=1",
         worker_plan.eval_workers,
         worker_plan.total_workers,
@@ -1922,6 +2061,7 @@ def run(args: argparse.Namespace) -> int:
         paths_json = run_root / "pxmeter_paths.json"
         summary_dir = run_root / "summary"
         pred_view_dir = run_root / "target_predictions"
+        eval_shard_dir = run_root / "evaluation_shards"
         ref_view_dir = run_root / "reference_cifs"
         antibody_dir = run_root / "antibody"
         antibody_summary_dir = antibody_dir / "summary"
@@ -2057,30 +2197,33 @@ def run(args: argparse.Namespace) -> int:
             disable=not sys.stderr.isatty(),
         )
         try:
-            run_eval_args = [
-                "-i",
-                str(pred_view_dir),
-                "-o",
-                str(per_sample_dir),
-                "-m",
-                "protenix",
-                "-r",
-                batch_info.ref_assembly_id,
-                "-n",
-                str(worker_plan.eval_workers),
-            ]
+            run_eval_extra_args: list[str] = []
             if antibody_mode:
-                run_eval_args.extend(
+                run_eval_extra_args.extend(
                     ["-C", "metric.calc_cdr_h3_bb_rmsd=true"]
                 )
                 if ligand_rows["internal"]:
-                    run_eval_args.extend(["-l", str(internal_ligand_csv)])
+                    run_eval_extra_args.extend(
+                        ["-l", str(internal_ligand_csv)]
+                    )
             evaluation_started = time.perf_counter()
-            run_pxmeter_module(
-                "benchmark.run_eval",
-                tuple(run_eval_args),
-                env,
-            )
+            memory_events_before = read_cgroup_memory_events()
+            try:
+                run_evaluation_shards(
+                    pred_view_dir=pred_view_dir,
+                    per_sample_dir=per_sample_dir,
+                    shard_root=eval_shard_dir,
+                    aliases=tuple(alias_to_pdb_id),
+                    seeds=batch_info.seeds,
+                    ref_assembly_id=batch_info.ref_assembly_id,
+                    requested_workers=worker_plan.eval_workers,
+                    env=env,
+                    extra_arguments=tuple(run_eval_extra_args),
+                )
+            finally:
+                report_new_cgroup_memory_events(
+                    memory_events_before, read_cgroup_memory_events()
+                )
             LOGGER.info(
                 "PXMeter evaluation elapsed=%.2fs",
                 time.perf_counter() - evaluation_started,
