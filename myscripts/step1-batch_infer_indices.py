@@ -77,8 +77,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_MODEL_NAME = "protenix_base_default_v1.0.0"
-SUPPORTED_MODEL_NAMES = (DEFAULT_MODEL_NAME, "protenix-v2")
+SUPPORTED_MODEL_NAMES = ("protenix_base_default_v1.0.0", "protenix-v2")
 MODEL_TOKEN_LIMITS = {"protenix-v2": 2560}
 REQUIRED_CONFIDENCE_KEYS = {"ranking_score", "plddt", "ptm", "iptm"}
 LOGGER = logging.getLogger("batch_infer_indices")
@@ -147,8 +146,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         choices=SUPPORTED_MODEL_NAMES,
-        default=DEFAULT_MODEL_NAME,
-        help=f"模型架构（默认：{DEFAULT_MODEL_NAME}）。",
+        required=True,
+        help="模型架构（必填，必须与 checkpoint 匹配）。",
     )
     parser.add_argument(
         "--checkpoint",
