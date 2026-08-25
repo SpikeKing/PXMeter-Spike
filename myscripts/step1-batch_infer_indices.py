@@ -508,6 +508,58 @@ def configure_environment(args: argparse.Namespace) -> None:
     os.environ["PROTENIX_TEMPLATE_MMCIF_DIR"] = str(args.data_root / "mmcif")
 
 
+def initialize_independent_runner_environment(
+    runner: Any,
+    torch_module: Any,
+    dist_wrapper: Any,
+) -> None:
+    """初始化单 rank Runner 环境，但不重新创建分布式进程组。
+
+    批处理脚本只在任务规划阶段使用 torch.distributed，随后会统一销毁默认
+    进程组，让各 rank 独立完成耗时可能相差很大的推理。官方
+    ``InferenceRunner.init_env()`` 会在 ``world_size > 1`` 时无条件再次调用
+    ``dist.init_process_group()``；当 PDB 数少于 world size 时，无任务 rank
+    不会创建 Runner，有任务 rank 因而会永久等待这些缺席 rank。
+
+    这里保留官方实现中的设备绑定和内核配置检查，唯一有意省略的行为是重新
+    初始化 NCCL 进程组。
+    """
+
+    runner.print(
+        f"Independent inference environment: world size: {dist_wrapper.world_size}, "
+        f"global rank: {dist_wrapper.rank}, local rank: {dist_wrapper.local_rank}"
+    )
+    runner.use_cuda = torch_module.cuda.device_count() > 0
+    if runner.use_cuda:
+        runner.device = torch_module.device(f"cuda:{dist_wrapper.local_rank}")
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        all_gpu_ids = ",".join(
+            str(index) for index in range(torch_module.cuda.device_count())
+        )
+        devices = os.getenv("CUDA_VISIBLE_DEVICES", all_gpu_ids)
+        logging.info(
+            "LOCAL_RANK: %s - CUDA_VISIBLE_DEVICES: [%s]",
+            dist_wrapper.local_rank,
+            devices,
+        )
+        torch_module.cuda.set_device(runner.device)
+    else:
+        runner.device = torch_module.device("cpu")
+
+    if runner.configs.triangle_attention == "deepspeed":
+        cutlass_path = os.getenv("CUTLASS_PATH")
+        runner.print(f"env: {cutlass_path}")
+        if cutlass_path is None:
+            raise AssertionError(
+                "If use deepspeed (ds4sci), set CUTLASS_PATH environment variable "
+                "per the Protenix inference instructions."
+            )
+
+    if os.getenv("LAYERNORM_TYPE", "fast_layernorm") == "fast_layernorm":
+        logging.info("Kernels will be compiled when fast_layernorm is first called.")
+    logging.info("Finished independent inference environment initialization.")
+
+
 def build_configs(args: argparse.Namespace) -> Any:
     """合并基础、模型和命令行配置，生成推理 runner 所需配置。"""
 
@@ -1371,6 +1423,12 @@ def _run_unlocked(args: argparse.Namespace) -> int:
 
     class ExplicitCheckpointInferenceRunner(InferenceRunner):
         """保持官方 Runner 行为，但严格使用命令行给出的 checkpoint 路径。"""
+
+        def init_env(self) -> None:
+            # 规划阶段的默认进程组已经由所有 rank 统一销毁。不能调用父类实现，
+            # 因为它会按 torchrun 的 WORLD_SIZE 再建 NCCL 组，而无任务 rank 不会
+            # 构造 Runner，从而让有任务 rank 永久阻塞在 init_process_group()。
+            initialize_independent_runner_environment(self, torch, DIST_WRAPPER)
 
         def load_checkpoint(self) -> None:
             checkpoint_path = Path(self.configs.load_checkpoint_path)
