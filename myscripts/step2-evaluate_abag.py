@@ -689,12 +689,7 @@ def create_reference_cif_view(
     """创建保留结晶辅助实体、使用无下划线 ID 的参考视图。"""
 
     view_dir.mkdir(parents=True, exist_ok=False)
-    for alias, pdb_id in tqdm(
-        alias_to_pdb_id.items(),
-        desc="准备参考 CIF",
-        unit="PDB",
-        disable=not sys.stderr.isatty(),
-    ):
+    for alias, pdb_id in alias_to_pdb_id.items():
         source = reference_cifs[pdb_id]
         destination = view_dir / f"{alias}.cif"
         write_pxmeter_reference_cif(source, destination, pdb_id)
@@ -819,12 +814,7 @@ def prepare_antibody_targets(
     internal_ligand_rows: list[dict[str, str]] = []
     public_ligand_rows: list[dict[str, str]] = []
 
-    for alias, pdb_id in tqdm(
-        alias_to_pdb_id.items(),
-        desc="识别抗体和抗原",
-        unit="PDB",
-        disable=not sys.stderr.isatty(),
-    ):
+    for alias, pdb_id in alias_to_pdb_id.items():
         pdb_code = canonical_pdb_code(pdb_id)
         if pdb_code is None:
             append_unresolved(
@@ -1159,12 +1149,7 @@ def validate_target_predictions(
     """逐 PDB/seed 校验主 CIF 和置信度 JSON，避免漏样本后静默评估。"""
 
     problems: list[str] = []
-    for pdb_id in tqdm(
-        pdb_ids,
-        desc="检查预测文件",
-        unit="PDB",
-        disable=not sys.stderr.isatty(),
-    ):
+    for pdb_id in pdb_ids:
         pdb_dir = pred_dir / pdb_id
         if not pdb_dir.is_dir():
             problems.append(f"缺少预测目录：{pdb_dir}")
@@ -1299,7 +1284,7 @@ def run_evaluation_shards(
         total=len(tasks),
         desc="PXMeter 单目标评估",
         unit="项",
-        disable=not sys.stderr.isatty(),
+        disable=False,
     ) as progress:
         shard_inputs = {
             (alias, seed): create_evaluation_shard_view(
@@ -1663,29 +1648,14 @@ def postprocess_cdr_metrics(
         return []
     num_workers = min(num_workers, len(tasks))
     if num_workers == 1:
-        results = [
-            calculate_cdr_task(task)
-            for task in tqdm(
-                tasks,
-                total=len(tasks),
-                desc="计算六条 CDR RMSD",
-                unit="样本",
-                disable=not sys.stderr.isatty(),
-            )
-        ]
+        results = [calculate_cdr_task(task) for task in tasks]
     else:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             future_to_task = {
                 executor.submit(calculate_cdr_task, task): task for task in tasks
             }
             results = []
-            for future in tqdm(
-                as_completed(future_to_task),
-                total=len(future_to_task),
-                desc="计算六条 CDR RMSD",
-                unit="样本",
-                disable=not sys.stderr.isatty(),
-            ):
+            for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 try:
                     results.append(future.result())
@@ -2182,222 +2152,207 @@ def run(args: argparse.Namespace) -> int:
         for variable in THREAD_LIMIT_ENV_VARS:
             env[variable] = "1"
         add_pxmeter_to_pythonpath(env, pxmeter_root)
-        workflow = tqdm(
-            total=4 if antibody_mode else 2,
-            desc="PXMeter 全界面评估",
-            unit="阶段",
-            disable=True,
-        )
-        try:
-            run_eval_extra_args: list[str] = []
-            if antibody_mode:
+        run_eval_extra_args: list[str] = []
+        if antibody_mode:
+            run_eval_extra_args.extend(
+                ["-C", "metric.calc_cdr_h3_bb_rmsd=true"]
+            )
+            if ligand_rows["internal"]:
                 run_eval_extra_args.extend(
-                    ["-C", "metric.calc_cdr_h3_bb_rmsd=true"]
+                    ["-l", str(internal_ligand_csv)]
                 )
-                if ligand_rows["internal"]:
-                    run_eval_extra_args.extend(
-                        ["-l", str(internal_ligand_csv)]
-                    )
-            evaluation_started = time.perf_counter()
-            memory_events_before = read_cgroup_memory_events()
-            try:
-                run_evaluation_shards(
-                    pred_view_dir=pred_view_dir,
-                    per_sample_dir=per_sample_dir,
-                    shard_root=eval_shard_dir,
-                    aliases=tuple(alias_to_pdb_id),
-                    seeds=batch_info.seeds,
-                    ref_assembly_id=batch_info.ref_assembly_id,
-                    requested_workers=worker_plan.eval_workers,
-                    env=env,
-                    extra_arguments=tuple(run_eval_extra_args),
-                )
-            finally:
-                report_new_cgroup_memory_events(
-                    memory_events_before, read_cgroup_memory_events()
-                )
-            LOGGER.info(
-                "结构评估完成，用时 %.2f 秒",
-                time.perf_counter() - evaluation_started,
+        evaluation_started = time.perf_counter()
+        memory_events_before = read_cgroup_memory_events()
+        try:
+            run_evaluation_shards(
+                pred_view_dir=pred_view_dir,
+                per_sample_dir=per_sample_dir,
+                shard_root=eval_shard_dir,
+                aliases=tuple(alias_to_pdb_id),
+                seeds=batch_info.seeds,
+                ref_assembly_id=batch_info.ref_assembly_id,
+                requested_workers=worker_plan.eval_workers,
+                env=env,
+                extra_arguments=tuple(run_eval_extra_args),
             )
-            workflow.update(1)
+        finally:
+            report_new_cgroup_memory_events(
+                memory_events_before, read_cgroup_memory_events()
+            )
+        LOGGER.info(
+            "结构评估完成，用时 %.2f 秒",
+            time.perf_counter() - evaluation_started,
+        )
 
-            restore_pxmeter_target_ids(per_sample_dir, alias_to_pdb_id)
-            metric_count, error_logs = validate_evaluation_results(
-                prediction_count, per_sample_dir
+        restore_pxmeter_target_ids(per_sample_dir, alias_to_pdb_id)
+        metric_count, error_logs = validate_evaluation_results(
+            prediction_count, per_sample_dir
+        )
+        antibody_subset_rows: list[dict[str, str]] = []
+        cdr_rows: list[dict[str, Any]] = []
+        if antibody_mode:
+            cdr_started = time.perf_counter()
+            cdr_rows = postprocess_cdr_metrics(
+                antibody_targets,
+                args.pred_dir,
+                per_sample_dir,
+                batch_info,
+                worker_plan.total_workers,
+                unresolved_rows,
             )
-            antibody_subset_rows: list[dict[str, str]] = []
-            cdr_rows: list[dict[str, Any]] = []
-            if antibody_mode:
-                cdr_started = time.perf_counter()
-                cdr_rows = postprocess_cdr_metrics(
+            LOGGER.info(
+                "六条 CDR RMSD 计算完成，用时 %.2f 秒",
+                time.perf_counter() - cdr_started,
+            )
+            antibody_subset_rows, antibody_detail_rows = (
+                build_antibody_subset_and_details(
                     antibody_targets,
-                    args.pred_dir,
                     per_sample_dir,
                     batch_info,
-                    worker_plan.total_workers,
                     unresolved_rows,
                 )
-                LOGGER.info(
-                    "六条 CDR RMSD 计算完成，用时 %.2f 秒",
-                    time.perf_counter() - cdr_started,
-                )
-                antibody_subset_rows, antibody_detail_rows = (
-                    build_antibody_subset_and_details(
-                        antibody_targets,
-                        per_sample_dir,
-                        batch_info,
-                        unresolved_rows,
-                    )
-                )
-                write_csv(
-                    antibody_dir / "subset.csv",
-                    ("type", "entry_id", "chain_id_1", "chain_id_2"),
-                    antibody_subset_rows,
-                )
-                write_csv(
-                    antibody_dir / "per_sample_metrics.csv",
-                    (
-                        "entry_id",
-                        "seed",
-                        "sample",
-                        "type",
-                        "antibody_chain",
-                        "antibody_role",
-                        "antigen_chain",
-                        "antigen_entity_type",
-                        "val_antibody_entity_id",
-                        "val_antigen_entity_id",
-                        "val_antibody_chain_ids",
-                        "val_antigen_chain_ids",
-                        "val_cluster_ids",
-                        "val_eval_types",
-                        "positioning_source",
-                        "sabdab_instances",
-                        "sabdab_heavy_chains",
-                        "sabdab_light_chains",
-                        "sabdab_antigen_chains",
-                        "sabdab_antigen_types",
-                        "sabdab_chain_mapping_status",
-                        "sabdab_unresolved_chains",
-                        "lddt",
-                        "bb_lddt",
-                        "dockq",
-                        "F1",
-                        "iRMSD",
-                        "LRMSD",
-                        "fnat",
-                        "fnonnat",
-                        "clashes",
-                        "lig_rmsd",
-                        "pocket_rmsd",
-                        "lddt_pli",
-                        "ref_pocket_chain",
-                        "pb_valid_json",
-                    ),
-                    antibody_detail_rows,
-                )
-                write_csv(
-                    antibody_dir / "cdr_metrics.csv",
-                    (
-                        "entry_id",
-                        "seed",
-                        "sample",
-                        "chain_id",
-                        "antibody_role",
-                        *CDR_BACKBONE_METRICS,
-                        "cdr_h3_recomputed",
-                    ),
-                    cdr_rows,
-                )
-                antibody_summary_dir.mkdir(parents=True)
-                write_csv(
-                    antibody_dir / "unresolved.csv",
-                    ("pdb_id", "instance_id", "chain_id", "reason", "detail"),
-                    sorted(
-                        unresolved_rows,
-                        key=lambda row: (
-                            row.get("pdb_id", ""),
-                            row.get("instance_id", ""),
-                            row.get("chain_id", ""),
-                            row.get("reason", ""),
-                            row.get("detail", ""),
-                        ),
-                    ),
-                )
-                workflow.update(1)
-            trial_name = args.pred_dir.name
-            write_json_atomic(
-                paths_json,
-                {
-                    trial_name: {
-                        "model": "protenix",
-                        "seeds": list(batch_info.seeds),
-                        "dataset_path": {"Custom": str(per_sample_dir)},
-                    }
-                },
             )
+            write_csv(
+                antibody_dir / "subset.csv",
+                ("type", "entry_id", "chain_id_1", "chain_id_2"),
+                antibody_subset_rows,
+            )
+            write_csv(
+                antibody_dir / "per_sample_metrics.csv",
+                (
+                    "entry_id",
+                    "seed",
+                    "sample",
+                    "type",
+                    "antibody_chain",
+                    "antibody_role",
+                    "antigen_chain",
+                    "antigen_entity_type",
+                    "val_antibody_entity_id",
+                    "val_antigen_entity_id",
+                    "val_antibody_chain_ids",
+                    "val_antigen_chain_ids",
+                    "val_cluster_ids",
+                    "val_eval_types",
+                    "positioning_source",
+                    "sabdab_instances",
+                    "sabdab_heavy_chains",
+                    "sabdab_light_chains",
+                    "sabdab_antigen_chains",
+                    "sabdab_antigen_types",
+                    "sabdab_chain_mapping_status",
+                    "sabdab_unresolved_chains",
+                    "lddt",
+                    "bb_lddt",
+                    "dockq",
+                    "F1",
+                    "iRMSD",
+                    "LRMSD",
+                    "fnat",
+                    "fnonnat",
+                    "clashes",
+                    "lig_rmsd",
+                    "pocket_rmsd",
+                    "lddt_pli",
+                    "ref_pocket_chain",
+                    "pb_valid_json",
+                ),
+                antibody_detail_rows,
+            )
+            write_csv(
+                antibody_dir / "cdr_metrics.csv",
+                (
+                    "entry_id",
+                    "seed",
+                    "sample",
+                    "chain_id",
+                    "antibody_role",
+                    *CDR_BACKBONE_METRICS,
+                    "cdr_h3_recomputed",
+                ),
+                cdr_rows,
+            )
+            antibody_summary_dir.mkdir(parents=True)
+            write_csv(
+                antibody_dir / "unresolved.csv",
+                ("pdb_id", "instance_id", "chain_id", "reason", "detail"),
+                sorted(
+                    unresolved_rows,
+                    key=lambda row: (
+                        row.get("pdb_id", ""),
+                        row.get("instance_id", ""),
+                        row.get("chain_id", ""),
+                        row.get("reason", ""),
+                        row.get("detail", ""),
+                    ),
+                ),
+            )
+        trial_name = args.pred_dir.name
+        write_json_atomic(
+            paths_json,
+            {
+                trial_name: {
+                    "model": "protenix",
+                    "seeds": list(batch_info.seeds),
+                    "dataset_path": {"Custom": str(per_sample_dir)},
+                }
+            },
+        )
 
-            aggregation_started = time.perf_counter()
+        aggregation_started = time.perf_counter()
+        run_pxmeter_module(
+            "benchmark.show_intersection_results",
+            (
+                "-i",
+                str(paths_json),
+                "-o",
+                str(summary_dir),
+                "-n",
+                str(worker_plan.aggregate_workers),
+                "--overwrite_agg",
+            ),
+            env,
+            quiet=True,
+        )
+        LOGGER.info(
+            "全部指标汇总完成，用时 %.2f 秒",
+            time.perf_counter() - aggregation_started,
+        )
+        if antibody_mode and antibody_subset_rows:
+            subset_aggregation_started = time.perf_counter()
             run_pxmeter_module(
                 "benchmark.show_intersection_results",
                 (
                     "-i",
                     str(paths_json),
                     "-o",
-                    str(summary_dir),
+                    str(antibody_summary_dir),
                     "-n",
                     str(worker_plan.aggregate_workers),
-                    "--overwrite_agg",
+                    "--subset_csv",
+                    str(antibody_dir / "subset.csv"),
                 ),
                 env,
                 quiet=True,
             )
             LOGGER.info(
-                "全部指标汇总完成，用时 %.2f 秒",
-                time.perf_counter() - aggregation_started,
+                "抗体子集汇总完成，用时 %.2f 秒",
+                time.perf_counter() - subset_aggregation_started,
             )
-            workflow.update(1)
-            if antibody_mode and antibody_subset_rows:
-                subset_aggregation_started = time.perf_counter()
-                run_pxmeter_module(
-                    "benchmark.show_intersection_results",
-                    (
-                        "-i",
-                        str(paths_json),
-                        "-o",
-                        str(antibody_summary_dir),
-                        "-n",
-                        str(worker_plan.aggregate_workers),
-                        "--subset_csv",
-                        str(antibody_dir / "subset.csv"),
-                    ),
-                    env,
-                    quiet=True,
+            antibody_summary_table = (
+                antibody_summary_dir / "Summary_table.csv"
+            )
+            if not antibody_summary_table.is_file():
+                raise EvaluationError(
+                    "PXMeter 抗体子集汇总完成，但未生成文件："
+                    f"{antibody_summary_table}"
                 )
-                LOGGER.info(
-                    "抗体子集汇总完成，用时 %.2f 秒",
-                    time.perf_counter() - subset_aggregation_started,
-                )
-                antibody_summary_table = (
-                    antibody_summary_dir / "Summary_table.csv"
-                )
-                if not antibody_summary_table.is_file():
-                    raise EvaluationError(
-                        "PXMeter 抗体子集汇总完成，但未生成文件："
-                        f"{antibody_summary_table}"
-                    )
-                workflow.update(1)
-            elif antibody_mode:
-                workflow.update(1)
-            if antibody_mode:
-                # PXMeter aggregation may create/replace files in this directory;
-                # publish the custom six-CDR summary last.
-                write_cdr_summary(
-                    antibody_summary_dir / "CDR_results.csv", cdr_rows
-                )
-        finally:
-            workflow.close()
+        if antibody_mode:
+            # PXMeter aggregation may create/replace files in this directory;
+            # publish the custom six-CDR summary last.
+            write_cdr_summary(
+                antibody_summary_dir / "CDR_results.csv", cdr_rows
+            )
 
         validate_summary_outputs(summary_dir)
 
