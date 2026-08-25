@@ -1147,7 +1147,7 @@ class LigandRecord:
     ranking_score: float
     lig_rmsd: float
     pocket_rmsd: float
-    lddt_pli: float
+    lddt_pli: float | None
     pb_valid: bool
     pb_failures: tuple[str, ...]
     name: str
@@ -1194,6 +1194,15 @@ def nonnegative(value: Any, label: str) -> float:
     if result < 0:
         raise SimplifyError(f"{label} must be non-negative, got {result}")
     return result
+
+
+def optional_finite(
+    value: Any, label: str, *, unit_interval: bool = False
+) -> float | None:
+    """Parse an optional numeric CSV field without turning missing data into zero."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return finite(value, label, unit_interval=unit_interval)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -1834,6 +1843,11 @@ def load_ligands(
         for values in raw_samples.values()
         for row in values
     }
+    samples_by_key = {
+        (row.entry_id, row.seed, row.sample): row
+        for values in raw_samples.values()
+        for row in values
+    }
     output = []
     seen = set()
     for row in read_csv(source, LIGAND_SOURCE_COLUMNS):
@@ -1851,6 +1865,13 @@ def load_ligands(
         rank_key = (entry, seed, sample)
         if rank_key not in ranking:
             raise SimplifyError(f"Missing ranking score for {rank_key}")
+        raw_sample = samples_by_key[rank_key]
+        raw_lddt_pli = raw_sample.chain_metrics.get(chain, {}).get("lddt_pli")
+        lddt_pli = optional_finite(
+            row["lddt_pli"], "LDDT-PLI", unit_interval=True
+        )
+        if lddt_pli is None:
+            lddt_pli = raw_lddt_pli
         try:
             pb = json.loads(row["pb_valid_json"])
         except json.JSONDecodeError as exc:
@@ -1878,7 +1899,7 @@ def load_ligands(
                 ranking[rank_key],
                 nonnegative(row["lig_rmsd"], "ligand RMSD"),
                 nonnegative(row["pocket_rmsd"], "pocket RMSD"),
-                finite(row["lddt_pli"], "LDDT-PLI", unit_interval=True),
+                lddt_pli,
                 not failures,
                 failures,
                 meta["name"].strip(),
@@ -1921,7 +1942,8 @@ def selected_ligands(records: Sequence[LigandRecord]) -> list[tuple[str, LigandR
             key=lambda row: (
                 row.lig_rmsd,
                 not row.pb_valid,
-                -row.lddt_pli,
+                row.lddt_pli is None,
+                -(row.lddt_pli or 0.0),
                 -row.ranking_score,
                 row.seed,
                 row.sample,
@@ -2012,7 +2034,11 @@ def ligand_tables(
                 "是否RMSD≤2Å": yes_no(row.lig_rmsd <= 2),
                 "是否PB-valid": yes_no(row.pb_valid),
                 "是否RMSD≤2Å且PB-valid": yes_no(row.lig_rmsd <= 2 and row.pb_valid),
-                "是否LDDT-PLI≥0.5（参考）": yes_no(row.lddt_pli >= 0.5),
+                "是否LDDT-PLI≥0.5（参考）": (
+                    yes_no(row.lddt_pli >= 0.5)
+                    if row.lddt_pli is not None
+                    else ""
+                ),
                 "PoseBusters未通过项": "|".join(row.pb_failures),
             }
         )
@@ -2027,6 +2053,19 @@ def ligand_tables(
         cluster_groups: dict[str, list[LigandRecord]] = defaultdict(list)
         for row in rows:
             cluster_groups[row.cluster_id].append(row)
+        lddt_groups = [
+            values
+            for group in cluster_groups.values()
+            if (
+                values := [
+                    item.lddt_pli for item in group if item.lddt_pli is not None
+                ]
+            )
+        ]
+        lddt_cluster_means = [mean(values) for values in lddt_groups]
+        lddt_cluster_rates = [
+            mean(value >= 0.5 for value in values) for values in lddt_groups
+        ]
 
         sums.append(
             {
@@ -2052,10 +2091,7 @@ def ligand_tables(
                 "中位数Pocket RMSD（Å）": fmt(median(pocket)),
                 "Pocket RMSD范围（Å）": value_range(pocket),
                 "平均LDDT-PLI": fmt(
-                    mean(
-                        mean(item.lddt_pli for item in group)
-                        for group in cluster_groups.values()
-                    )
+                    mean(lddt_cluster_means) if lddt_cluster_means else None
                 ),
                 "RMSD≤2Å成功率（%）": pct(
                     grouped_rate(
@@ -2071,10 +2107,10 @@ def ligand_tables(
                         lambda item: item.lig_rmsd <= 2 and item.pb_valid,
                     )
                 ),
-                "LDDT-PLI≥0.5参考率（%）": pct(
-                    grouped_rate(
-                        cluster_groups.values(), lambda item: item.lddt_pli >= 0.5
-                    )
+                "LDDT-PLI≥0.5参考率（%）": (
+                    pct(mean(lddt_cluster_rates))
+                    if lddt_cluster_rates
+                    else ""
                 ),
             }
         )
@@ -2131,16 +2167,24 @@ def ligand_pdb_tables(
         expected = {row.chain_id for row in candidates[0]}
         if any({row.chain_id for row in rows} != expected for rows in candidates):
             raise SimplifyError(f"Inconsistent ligand set across samples for {entry}")
-        oracle = min(
-            candidates,
-            key=lambda rows: (
+
+        def oracle_key(rows: Sequence[LigandRecord]) -> tuple[Any, ...]:
+            lddt_values = [
+                row.lddt_pli for row in rows if row.lddt_pli is not None
+            ]
+            return (
                 mean(row.lig_rmsd for row in rows),
                 -mean(row.pb_valid for row in rows),
-                -mean(row.lddt_pli for row in rows),
+                not lddt_values,
+                -mean(lddt_values) if lddt_values else 0.0,
                 -rows[0].ranking_score,
                 rows[0].seed,
                 rows[0].sample,
-            ),
+            )
+
+        oracle = min(
+            candidates,
+            key=oracle_key,
         )
         predicted = max(
             candidates,
