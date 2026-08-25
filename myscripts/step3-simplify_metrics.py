@@ -909,7 +909,7 @@ def build_pdb_structure_exports(
 
     suffix_by_method = {
         ORACLE: "_oracle.cif",
-        PREDICTED_BEST: ".pbest.cif",
+        PREDICTED_BEST: "_pbest.cif",
     }
     exports: list[PdbStructureExport] = []
     seen_destinations: set[str] = set()
@@ -962,7 +962,7 @@ def build_pdb_structure_exports(
                 f"Missing ground-truth PDB structure for {entry_id}: "
                 f"expected {plain_source} or {compressed_source}"
             )
-        filename = f"{entry_id}.gt.cif"
+        filename = f"{entry_id}_gt.cif"
         if filename in seen_destinations:
             raise SimplifyError(f"Duplicate PDB structure destination: {filename}")
         seen_destinations.add(filename)
