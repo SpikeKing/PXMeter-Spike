@@ -186,9 +186,8 @@ def report_new_cgroup_memory_events(
     }
     if increases:
         LOGGER.warning(
-            "The evaluation caused cgroup memory event(s): %s. This is a real "
-            "container memory-pressure event, not a worker-timeout problem. "
-            "Reduce --num-cpu or increase the container memory limit if it recurs.",
+            "评估触发了容器内存事件：%s。这是实际的容器内存压力，并非 worker "
+            "超时；若再次发生，请减小 --num-cpu 或提高容器内存上限。",
             ", ".join(f"{name}=+{count}" for name, count in increases.items()),
         )
 
@@ -290,7 +289,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
 
@@ -298,32 +298,32 @@ def configure_logging() -> None:
 def require_file(path: Path, label: str) -> Path:
     resolved = path.expanduser().resolve()
     if not resolved.is_file():
-        raise ConfigurationError(f"Missing {label}: {resolved}")
+        raise ConfigurationError(f"缺少{label}：{resolved}")
     return resolved
 
 
 def require_dir(path: Path, label: str) -> Path:
     resolved = path.expanduser().resolve()
     if not resolved.is_dir():
-        raise ConfigurationError(f"Missing {label}: {resolved}")
+        raise ConfigurationError(f"缺少{label}：{resolved}")
     return resolved
 
 
 def validate_args(args: argparse.Namespace) -> argparse.Namespace:
-    args.pred_dir = require_dir(args.pred_dir, "prediction directory")
-    args.ref_dir = require_dir(args.ref_dir, "reference mmCIF directory")
+    args.pred_dir = require_dir(args.pred_dir, "预测目录")
+    args.ref_dir = require_dir(args.ref_dir, "参考 mmCIF 目录")
     args.sabdab_summary_csv = getattr(args, "sabdab_summary_csv", None)
     if args.sabdab_summary_csv is not None:
         args.sabdab_summary_csv = require_file(
-            args.sabdab_summary_csv, "SAbDab summary CSV"
+            args.sabdab_summary_csv, "SAbDab 汇总 CSV"
         )
     args.output_root = args.output_root.expanduser().resolve()
     if args.num_cpu == 0 or args.num_cpu < -1:
-        raise ConfigurationError("--num-cpu must be -1 or a positive integer")
+        raise ConfigurationError("--num-cpu 必须为 -1 或正整数")
     args.output_root.mkdir(parents=True, exist_ok=True)
     if not os.access(args.output_root, os.W_OK):
         raise ConfigurationError(
-            f"Output directory is not writable: {args.output_root}"
+            f"输出目录不可写：{args.output_root}"
         )
     return args
 
@@ -331,13 +331,13 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 def load_batch_info(pred_dir: Path) -> BatchInfo:
     """读取 batch summary，并严格校验本轮推理和参考结构范围。"""
 
-    summary_path = require_file(pred_dir / "batch_summary.json", "batch summary")
+    summary_path = require_file(pred_dir / "batch_summary.json", "批次汇总文件")
     try:
         with summary_path.open("r", encoding="utf-8") as handle:
             summary = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigurationError(
-            f"Cannot read valid JSON from {summary_path}: {exc}"
+            f"无法从 {summary_path} 读取有效 JSON：{exc}"
         ) from exc
 
     seeds = summary.get("seeds") if isinstance(summary, dict) else None
@@ -354,19 +354,17 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
         or len(set(seeds)) != len(seeds)
     ):
         raise ConfigurationError(
-            f"Invalid seeds in {summary_path}; expected a non-empty list of "
-            "unique non-negative integers"
+            f"{summary_path} 中的 seeds 无效；应为非空、无重复的非负整数列表"
         )
     if type(samples) is not int or samples <= 0:
         raise ConfigurationError(
-            f"Invalid samples in {summary_path}; expected a positive integer"
+            f"{summary_path} 中的 samples 无效；应为正整数"
         )
     if pdb_ids is None or ref_assembly_id is None:
         raise ConfigurationError(
-            f"Legacy batch summary lacks pdb_ids/ref_assembly_id: {summary_path}. "
-            "Rerun step1-batch_infer_indices.py with the same arguments and "
-            "without --overwrite; complete predictions will be skipped while "
-            "the summary is upgraded."
+            f"旧版批次汇总缺少 pdb_ids/ref_assembly_id：{summary_path}。请使用"
+            "相同参数且不加 --overwrite 重新运行 step1-batch_infer_indices.py；"
+            "已有完整预测会被跳过，同时升级汇总文件。"
         )
     if (
         not isinstance(pdb_ids, list)
@@ -380,17 +378,17 @@ def load_batch_info(pred_dir: Path) -> BatchInfo:
         or len(set(pdb_ids)) != len(pdb_ids)
     ):
         raise ConfigurationError(
-            f"Invalid pdb_ids in {summary_path}; expected a non-empty list of "
-            "unique, normalized lowercase strings"
+            f"{summary_path} 中的 pdb_ids 无效；应为非空、无重复且已规范为"
+            "小写的字符串列表"
         )
     if not isinstance(ref_assembly_id, str) or not ref_assembly_id.strip():
         raise ConfigurationError(
-            f"Invalid ref_assembly_id in {summary_path}; expected a non-empty string"
+            f"{summary_path} 中的 ref_assembly_id 无效；应为非空字符串"
         )
     if not isinstance(indices_csv, str) or not indices_csv.strip():
         raise ConfigurationError(
-            f"Invalid indices_csv in {summary_path}; expected the non-empty path "
-            "recorded by step1-batch_infer_indices.py"
+            f"{summary_path} 中的 indices_csv 无效；应为 "
+            "step1-batch_infer_indices.py 记录的非空路径"
         )
     return BatchInfo(
         tuple(seeds),
@@ -413,7 +411,7 @@ def load_target_index_records(
 ) -> dict[str, tuple[IndexRecord, ...]]:
     """加载本轮目标的 val chain/interface 行，并严格校验定位字段。"""
 
-    path = require_file(indices_csv, "indices CSV recorded in batch summary")
+    path = require_file(indices_csv, "批次汇总中记录的 indices CSV")
     target_ids = set(pdb_ids)
     grouped: dict[str, list[IndexRecord]] = defaultdict(list)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -422,7 +420,7 @@ def load_target_index_records(
         missing = sorted(REQUIRED_INDEX_COLUMNS - fields)
         if missing:
             raise ConfigurationError(
-                f"{path} is missing required index columns: {', '.join(missing)}"
+                f"{path} 缺少必需的索引列：{', '.join(missing)}"
             )
         for row_number, row in enumerate(reader, start=2):
             pdb_id = (row.get("pdb_id") or "").strip().lower()
@@ -435,33 +433,33 @@ def load_target_index_records(
             chain_2_id = (row.get("chain_2_id") or "").strip()
             if record_type not in {"chain", "interface"}:
                 raise ConfigurationError(
-                    f"Invalid type={record_type!r} in {path}:{row_number}; "
-                    "expected chain or interface"
+                    f"{path}:{row_number} 中的 type={record_type!r} 无效；"
+                    "应为 chain 或 interface"
                 )
             if not entity_1_id or not chain_1_id:
                 raise ConfigurationError(
-                    f"Missing entity_1_id/chain_1_id in {path}:{row_number}"
+                    f"{path}:{row_number} 缺少 entity_1_id/chain_1_id"
                 )
             if not (row.get("mol_1_type") or "").strip():
                 raise ConfigurationError(
-                    f"Missing mol_1_type in {path}:{row_number}"
+                    f"{path}:{row_number} 缺少 mol_1_type"
                 )
             if not (row.get("cluster_id") or "").strip() or not (
                 row.get("eval_type") or ""
             ).strip():
                 raise ConfigurationError(
-                    f"Missing cluster_id/eval_type in {path}:{row_number}"
+                    f"{path}:{row_number} 缺少 cluster_id/eval_type"
                 )
             if record_type == "interface" and (not entity_2_id or not chain_2_id):
                 raise ConfigurationError(
-                    f"Missing entity_2_id/chain_2_id for interface in "
-                    f"{path}:{row_number}"
+                    f"{path}:{row_number} 的 interface 记录缺少 "
+                    "entity_2_id/chain_2_id"
                 )
             if record_type == "interface" and not (
                 row.get("mol_2_type") or ""
             ).strip():
                 raise ConfigurationError(
-                    f"Missing mol_2_type for interface in {path}:{row_number}"
+                    f"{path}:{row_number} 的 interface 记录缺少 mol_2_type"
                 )
             grouped[pdb_id].append(
                 IndexRecord(
@@ -480,7 +478,7 @@ def load_target_index_records(
     missing_targets = [pdb_id for pdb_id in pdb_ids if not grouped.get(pdb_id)]
     if missing_targets:
         raise ConfigurationError(
-            f"Indices CSV {path} has no rows for batch target(s): "
+            f"Indices CSV {path} 中没有以下批次目标的记录："
             + ", ".join(missing_targets)
         )
     return {pdb_id: tuple(grouped[pdb_id]) for pdb_id in pdb_ids}
@@ -521,14 +519,14 @@ def load_sabdab_instances(
         missing = sorted(REQUIRED_SABDAB_COLUMNS - fields)
         if missing:
             raise ConfigurationError(
-                f"{path} is missing required SAbDab columns: {', '.join(missing)}"
+                f"{path} 缺少必需的 SAbDab 列：{', '.join(missing)}"
             )
         for row_number, row in enumerate(reader, start=2):
             pdb_code = canonical_pdb_code(row.get("PDB"))
             instance_id = (row.get("INSTANCE") or "").strip()
             if not pdb_code or not instance_id:
                 LOGGER.warning(
-                    "Skipping malformed SAbDab row %d (PDB=%r, INSTANCE=%r)",
+                    "跳过格式异常的 SAbDab 第 %d 行（PDB=%r，INSTANCE=%r）",
                     row_number,
                     row.get("PDB"),
                     row.get("INSTANCE"),
@@ -545,7 +543,7 @@ def load_sabdab_instances(
                 )
             )
     if not grouped:
-        raise ConfigurationError(f"No valid SAbDab records found in {path}")
+        raise ConfigurationError(f"{path} 中没有有效的 SAbDab 记录")
     return {key: tuple(value) for key, value in grouped.items()}
 
 
@@ -625,9 +623,9 @@ def validate_reference_cifs(
 
     if missing:
         preview = ", ".join(missing[:10])
-        suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+        suffix = "" if len(missing) <= 10 else f"……另有 {len(missing) - 10} 个"
         raise ConfigurationError(
-            f"Missing {len(missing)} reference CIF file(s) in {ref_dir}: "
+            f"{ref_dir} 中缺少 {len(missing)} 个参考 CIF 文件："
             f"{preview}{suffix}"
         )
     return reference_cifs
@@ -672,15 +670,14 @@ def write_pxmeter_reference_cif(
         prepared_cif = pdbx.CIFFile.read(destination)
         prepared_block = prepared_cif.block
         if "exptl" in prepared_block:
-            raise ValueError("temporary CIF still contains the exptl category")
+            raise ValueError("临时 CIF 仍包含 exptl 类别")
         if "atom_site" not in prepared_block:
-            raise ValueError("temporary CIF does not contain an atom_site category")
+            raise ValueError("临时 CIF 不包含 atom_site 类别")
         _ = prepared_block["atom_site"]
     except Exception as exc:
         destination.unlink(missing_ok=True)
         raise ConfigurationError(
-            f"Cannot prepare PXMeter reference CIF for {pdb_id} from "
-            f"{source}: {exc}"
+            f"无法使用 {source} 为 {pdb_id} 准备 PXMeter 参考 CIF：{exc}"
         ) from exc
 
 
@@ -808,7 +805,7 @@ def prepare_antibody_targets(
         from pxmeter.metrics.antibody.annotation import AntibodyAnnotator
     except ImportError as exc:
         raise ConfigurationError(
-            "Antibody mode requires PXMeter's numpy/biotite/ANARCII dependencies"
+            "抗体模式需要 PXMeter 的 numpy、biotite 和 ANARCII 依赖"
         ) from exc
 
     annotator = AntibodyAnnotator(
@@ -1170,7 +1167,7 @@ def validate_target_predictions(
     ):
         pdb_dir = pred_dir / pdb_id
         if not pdb_dir.is_dir():
-            problems.append(f"missing prediction directory: {pdb_dir}")
+            problems.append(f"缺少预测目录：{pdb_dir}")
             continue
 
         for seed in seeds:
@@ -1207,14 +1204,14 @@ def validate_target_predictions(
                 - (expected_cifs | expected_confidences)
             )
             if missing:
-                problems.append(f"missing {len(missing)} file(s); first: {missing[0]}")
+                problems.append(f"缺少 {len(missing)} 个文件；首个：{missing[0]}")
             if extra:
-                problems.append(f"unexpected {len(extra)} file(s); first: {extra[0]}")
+                problems.append(f"发现 {len(extra)} 个多余文件；首个：{extra[0]}")
 
     if problems:
         preview = "; ".join(problems[:10])
-        suffix = "" if len(problems) <= 10 else f"; ... and {len(problems) - 10} more"
-        raise ConfigurationError(f"Incomplete target predictions: {preview}{suffix}")
+        suffix = "" if len(problems) <= 10 else f"；……另有 {len(problems) - 10} 项"
+        raise ConfigurationError(f"目标预测文件不完整：{preview}{suffix}")
     return len(pdb_ids) * len(seeds) * samples
 
 
@@ -1288,9 +1285,7 @@ def run_evaluation_shards(
     seeds = tuple(seeds)
     max_workers = max(1, min(requested_workers, len(aliases)))
     LOGGER.info(
-        "Memory-safe PXMeter scheduling: target/seed processes=%d; "
-        "concurrent processes=%d (requested=%d, targets=%d); "
-        "PXMeter workers per process=1",
+        "开始结构评估：共 %d 个目标与 seed 组合，并发数 %d（请求 %d，目标数 %d）",
         len(aliases) * len(seeds),
         max_workers,
         requested_workers,
@@ -1300,7 +1295,7 @@ def run_evaluation_shards(
     with tqdm(
         total=len(aliases) * len(seeds),
         desc="PXMeter 单目标评估",
-        unit="target/seed",
+        unit="项",
         disable=not sys.stderr.isatty(),
     ) as progress:
         for seed in seeds:
@@ -1329,6 +1324,7 @@ def run_evaluation_shards(
                             *extra_arguments,
                         ),
                         env,
+                        quiet=True,
                     ): alias
                     for alias, shard_input in shard_inputs.items()
                 }
@@ -1338,8 +1334,8 @@ def run_evaluation_shards(
                         future.result()
                     except Exception as exc:
                         raise EvaluationError(
-                            f"PXMeter evaluation failed for target={alias}, "
-                            f"seed={seed}: {exc}"
+                            f"PXMeter 结构评估失败：目标={alias}，"
+                            f"seed={seed}：{exc}"
                         ) from exc
                     progress.update(1)
 
@@ -1356,8 +1352,8 @@ def restore_pxmeter_target_ids(
         if alias_result_dir.is_dir():
             if pdb_result_dir.exists():
                 raise EvaluationError(
-                    f"Cannot restore PXMeter target {alias} to {pdb_id}: "
-                    f"destination already exists: {pdb_result_dir}"
+                    f"无法将 PXMeter 目标 {alias} 恢复为 {pdb_id}："
+                    f"目标路径已存在：{pdb_result_dir}"
                 )
             alias_result_dir.rename(pdb_result_dir)
             for metrics_json in pdb_result_dir.rglob("sample_*_metrics.json"):
@@ -1366,12 +1362,11 @@ def restore_pxmeter_target_ids(
                         metrics = json.load(handle)
                 except (OSError, json.JSONDecodeError) as exc:
                     raise EvaluationError(
-                        f"Cannot restore target ID in {metrics_json}: {exc}"
+                        f"无法恢复 {metrics_json} 中的目标 ID：{exc}"
                     ) from exc
                 if not isinstance(metrics, dict):
                     raise EvaluationError(
-                        f"Cannot restore target ID in {metrics_json}: "
-                        "expected a JSON object"
+                        f"无法恢复 {metrics_json} 中的目标 ID：内容应为 JSON 对象"
                     )
                 metrics["entry_id"] = pdb_id
                 write_json_atomic(metrics_json, metrics)
@@ -1381,8 +1376,8 @@ def restore_pxmeter_target_ids(
             pdb_error_dir = error_dir / pdb_id
             if pdb_error_dir.exists():
                 raise EvaluationError(
-                    f"Cannot restore PXMeter error target {alias} to {pdb_id}: "
-                    f"destination already exists: {pdb_error_dir}"
+                    f"无法将 PXMeter 错误目标 {alias} 恢复为 {pdb_id}："
+                    f"目标路径已存在：{pdb_error_dir}"
                 )
             alias_error_dir.rename(pdb_error_dir)
 
@@ -1409,16 +1404,15 @@ def validate_evaluation_results(
     error_logs = find_error_logs(per_sample_dir)
     problems = []
     if error_logs:
-        problems.append(f"PXMeter wrote {len(error_logs)} error log(s)")
+        problems.append(f"PXMeter 生成了 {len(error_logs)} 个错误日志")
     if metric_count != expected_count:
         problems.append(
-            f"metric JSON count {metric_count} does not match prediction CIF "
-            f"count {expected_count}"
+            f"指标 JSON 数量 {metric_count} 与预测 CIF 数量 {expected_count} 不一致"
         )
     if problems:
         details = "; ".join(problems)
         if error_logs:
-            details += f"; first error: {error_logs[0]}"
+            details += f"；首个错误日志：{error_logs[0]}"
         raise EvaluationError(details)
     return metric_count, error_logs
 
@@ -2030,9 +2024,8 @@ def run(args: argparse.Namespace) -> int:
     for variable in THREAD_LIMIT_ENV_VARS:
         os.environ[variable] = "1"
     LOGGER.info(
-        "Stage worker ceilings: evaluation=%d (further capped by target count; "
-        "one PXMeter worker per target/seed process), CDR=%d, aggregation=%d; "
-        "BLAS/OpenMP threads per worker=1",
+        "并行配置：结构评估最多 %d 个进程，CDR 计算最多 %d 个进程，"
+        "结果汇总最多 %d 个进程；每个进程使用 1 个 BLAS/OpenMP 线程",
         worker_plan.eval_workers,
         worker_plan.total_workers,
         worker_plan.aggregate_workers,
@@ -2081,9 +2074,8 @@ def run(args: argparse.Namespace) -> int:
             reference_cifs, alias_to_pdb_id, ref_view_dir
         )
         LOGGER.info(
-            "Prepared temporary reference CIFs without _exptl metadata; "
-            "crystallization aids such as SO4/GOL/PEG will participate in "
-            "PXMeter mapping and metrics"
+            "参考 CIF 已就绪：临时副本已移除 _exptl 元数据，SO4/GOL/PEG 等"
+            "结晶辅助实体仍参与映射和指标计算"
         )
         create_target_prediction_view(
             args.pred_dir,
@@ -2154,8 +2146,8 @@ def run(args: argparse.Namespace) -> int:
                     args.output_root,
                 )
                 raise ConfigurationError(
-                    "SAbDab antibody mode found no val entity + ANARCII target; "
-                    f"unresolved.csv was published. Reasons: {reason_summary or 'none'}"
+                    "SAbDab 抗体模式未找到 val entity + ANARCII 目标；已发布 "
+                    f"unresolved.csv。原因：{reason_summary or '无'}"
                 )
             write_csv(
                 antibody_dir / "ligand_info.csv",
@@ -2169,8 +2161,7 @@ def run(args: argparse.Namespace) -> int:
                     ligand_rows["internal"],
                 )
             LOGGER.info(
-                "Prepared antibody metadata for %d/%d target(s); "
-                "ligand chains=%d; elapsed=%.2fs",
+                "抗体元数据已就绪：有效目标 %d/%d，配体链 %d 条，用时 %.2f 秒",
                 len(antibody_targets),
                 len(pdb_ids),
                 len(ligand_rows["internal"]),
@@ -2178,8 +2169,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
         LOGGER.info(
-            "Prepared all default chain/interface metrics for %d PDB(s); "
-            "seeds=%s, samples=%d",
+            "评估范围：%d 个 PDB，seed=%s，每个 seed %d 个样本",
             len(pdb_ids),
             ",".join(map(str, batch_info.seeds)),
             batch_info.samples,
@@ -2194,7 +2184,7 @@ def run(args: argparse.Namespace) -> int:
             total=4 if antibody_mode else 2,
             desc="PXMeter 全界面评估",
             unit="阶段",
-            disable=not sys.stderr.isatty(),
+            disable=True,
         )
         try:
             run_eval_extra_args: list[str] = []
@@ -2225,7 +2215,7 @@ def run(args: argparse.Namespace) -> int:
                     memory_events_before, read_cgroup_memory_events()
                 )
             LOGGER.info(
-                "PXMeter evaluation elapsed=%.2fs",
+                "结构评估完成，用时 %.2f 秒",
                 time.perf_counter() - evaluation_started,
             )
             workflow.update(1)
@@ -2247,7 +2237,7 @@ def run(args: argparse.Namespace) -> int:
                     unresolved_rows,
                 )
                 LOGGER.info(
-                    "Six-CDR postprocessing elapsed=%.2fs",
+                    "六条 CDR RMSD 计算完成，用时 %.2f 秒",
                     time.perf_counter() - cdr_started,
                 )
                 antibody_subset_rows, antibody_detail_rows = (
@@ -2359,9 +2349,10 @@ def run(args: argparse.Namespace) -> int:
                     "--overwrite_agg",
                 ),
                 env,
+                quiet=True,
             )
             LOGGER.info(
-                "PXMeter full aggregation elapsed=%.2fs",
+                "全部指标汇总完成，用时 %.2f 秒",
                 time.perf_counter() - aggregation_started,
             )
             workflow.update(1)
@@ -2380,9 +2371,10 @@ def run(args: argparse.Namespace) -> int:
                         str(antibody_dir / "subset.csv"),
                     ),
                     env,
+                    quiet=True,
                 )
                 LOGGER.info(
-                    "PXMeter antibody subset aggregation elapsed=%.2fs",
+                    "抗体子集汇总完成，用时 %.2f 秒",
                     time.perf_counter() - subset_aggregation_started,
                 )
                 antibody_summary_table = (
@@ -2390,7 +2382,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if not antibody_summary_table.is_file():
                     raise EvaluationError(
-                        "PXMeter antibody aggregation completed without "
+                        "PXMeter 抗体子集汇总完成，但未生成文件："
                         f"{antibody_summary_table}"
                     )
                 workflow.update(1)
@@ -2423,22 +2415,21 @@ def run(args: argparse.Namespace) -> int:
         publish_run_results(run_root, args.output_root)
 
     LOGGER.info(
-        "PXMeter finished: prediction_cifs=%d, metric_jsons=%d, errors=%d",
+        "评估完成：预测 CIF %d 个，指标 JSON %d 个，错误 %d 个",
         prediction_count,
         metric_count,
         len(error_logs),
     )
-    LOGGER.info("DockQ results: %s", args.output_root / "summary/DockQ_results.csv")
-    LOGGER.info("LDDT results: %s", args.output_root / "summary/LDDT_results.csv")
+    LOGGER.info("DockQ 结果：%s", args.output_root / "summary/DockQ_results.csv")
+    LOGGER.info("LDDT 结果：%s", args.output_root / "summary/LDDT_results.csv")
     rmsd_results = args.output_root / "summary/RMSD_results.csv"
     if rmsd_results.is_file():
-        LOGGER.info("RMSD results: %s", rmsd_results)
+        LOGGER.info("RMSD 结果：%s", rmsd_results)
     else:
         LOGGER.info(
-            "RMSD results were not generated because PXMeter found no "
-            "ligand RMSD metrics to aggregate"
+            "未生成 RMSD 结果：PXMeter 未发现可汇总的配体 RMSD 指标"
         )
-    LOGGER.info("Summary table: %s", args.output_root / "summary/Summary_table.csv")
+    LOGGER.info("汇总表：%s", args.output_root / "summary/Summary_table.csv")
     return 0
 
 
@@ -2447,13 +2438,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return run(parse_args(argv))
     except ConfigurationError as exc:
-        LOGGER.error("Configuration error: %s", exc)
+        LOGGER.error("配置错误：%s", exc)
         return 2
     except EvaluationError as exc:
-        LOGGER.error("Evaluation failed: %s", exc)
+        LOGGER.error("评估失败：%s", exc)
         return 1
     except OSError as exc:
-        LOGGER.error("I/O error: %s", exc)
+        LOGGER.error("文件读写错误：%s", exc)
         return 2
 
 

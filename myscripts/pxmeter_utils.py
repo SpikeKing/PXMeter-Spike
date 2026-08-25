@@ -69,8 +69,14 @@ def run_pxmeter_module(
     module: str,
     arguments: Sequence[str],
     env: Mapping[str, str],
+    *,
+    quiet: bool = False,
 ) -> None:
-    """使用当前 Python 运行 PXMeter 模块，并将输出直接转发到终端。"""
+    """使用当前 Python 运行 PXMeter 模块。
+
+    ``quiet`` 用于批量工作流：成功时不转发子进程的重复进度和 INFO 日志；
+    失败时仍附带末尾输出，确保诊断信息不会因精简日志而丢失。
+    """
 
     command = [sys.executable, "-m", module, *arguments]
     completed = subprocess.run(
@@ -78,10 +84,21 @@ def run_pxmeter_module(
         cwd=REPO_ROOT,
         env=dict(env),
         check=False,
+        stdout=subprocess.PIPE if quiet else None,
+        stderr=subprocess.STDOUT if quiet else None,
+        text=quiet,
+        encoding="utf-8" if quiet else None,
+        errors="replace" if quiet else None,
     )
     if completed.returncode != 0:
+        output_suffix = ""
+        if quiet and completed.stdout:
+            lines = [line for line in completed.stdout.splitlines() if line.strip()]
+            if lines:
+                output_suffix = "\n子进程末尾输出：\n" + "\n".join(lines[-40:])
         raise EvaluationError(
-            f"PXMeter module {module} exited with status {completed.returncode}"
+            f"PXMeter 模块 {module} 退出，状态码为 {completed.returncode}"
+            f"{output_suffix}"
         )
 
 
