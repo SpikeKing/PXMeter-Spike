@@ -85,6 +85,8 @@ PROGRESS_DIR_NAME = ".batch_progress"
 PROGRESS_POLL_SECONDS = 0.5
 PROGRESS_HEARTBEAT_SECONDS = 60.0
 FINAL_STATUS_TIMEOUT_SECONDS = 600.0
+PROGRESS_CLEANUP_ATTEMPTS = 5
+PROGRESS_CLEANUP_RETRY_SECONDS = 0.2
 STAT_KEYS = ("assigned", "succeeded", "skipped", "failed")
 ASSIGNMENT_STRATEGY = "greedy_num_tokens_squared"
 OUTPUT_LOCK_NAME = ".batch_infer.lock"
@@ -902,13 +904,57 @@ def progress_enabled(log_level: str) -> bool:
     return log_level == "verbose"
 
 
+def try_remove_progress_dir(
+    progress_dir: Path,
+    *,
+    attempts: int = PROGRESS_CLEANUP_ATTEMPTS,
+    retry_seconds: float = PROGRESS_CLEANUP_RETRY_SECONDS,
+) -> bool:
+    """尽力删除进度目录；NFS 临时忙时短暂重试但不抛出异常。"""
+
+    for attempt in range(max(attempts, 1)):
+        try:
+            shutil.rmtree(progress_dir)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt + 1 < max(attempts, 1):
+                time.sleep(retry_seconds)
+    return False
+
+
+def cleanup_progress_dir(progress_dir: Path) -> None:
+    """清理临时进度状态，失败仅告警，不能覆盖批处理的最终退出码。"""
+
+    if try_remove_progress_dir(progress_dir):
+        return
+    LOGGER.warning(
+        "Could not remove temporary progress directory %s; it may contain an "
+        "NFS .nfs* file that is still open. Inference results are complete and "
+        "the directory can be removed after the file is released.",
+        progress_dir,
+    )
+
+
 def reset_progress_dir(progress_dir: Path) -> None:
-    """清理上次中断的状态并创建本次运行的进度目录。"""
+    """隔离上次中断的状态并创建本次运行的进度目录。"""
 
     if progress_dir.is_symlink() or progress_dir.is_file():
         progress_dir.unlink()
-    elif progress_dir.exists():
-        shutil.rmtree(progress_dir)
+    elif progress_dir.exists() and not try_remove_progress_dir(progress_dir):
+        # NFS 会把仍被打开的已删除文件改名为 .nfs*，使 rmtree 返回 EBUSY。
+        # 先原子移走旧目录，避免旧 rank 状态污染新一轮运行。
+        stale_dir = progress_dir.with_name(
+            f"{progress_dir.name}.stale-{os.getpid()}-{time.time_ns()}"
+        )
+        progress_dir.replace(stale_dir)
+        LOGGER.warning(
+            "Moved busy stale progress directory to %s; it will be removed "
+            "when its open NFS file is released.",
+            stale_dir,
+        )
+        cleanup_progress_dir(stale_dir)
     progress_dir.mkdir(parents=True)
 
 
@@ -1843,7 +1889,7 @@ def _run_unlocked(args: argparse.Namespace) -> int:
         exit_code = batch_exit_code(total_stats)
 
     if rank == 0 and progress_dir.is_dir():
-        shutil.rmtree(progress_dir)
+        cleanup_progress_dir(progress_dir)
     # 非零 rank 始终正常退出，避免 torchrun 在 rank 0 完成全局汇总前提前终止
     # 其他仍在工作的进程；全局失败最终由 rank 0 的退出码表达。
     return exit_code
